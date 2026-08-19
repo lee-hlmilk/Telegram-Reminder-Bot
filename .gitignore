@@ -4,5 +4,3 @@ __pycache__/
 .pytest_cache/
 .venv/
 venv/
-data/reminders.json
-data/user_settings.json

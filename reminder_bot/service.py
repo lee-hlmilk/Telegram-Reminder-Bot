@@ -3,10 +3,10 @@ from __future__ import annotations
 import secrets
 import calendar
 from datetime import datetime, time, timedelta
+from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .models import Reminder
-from .storage import JsonReminderStore
 
 
 class ReminderInputError(ValueError):
@@ -57,7 +57,7 @@ def parse_daily_time(value: str) -> time:
 
 
 class ReminderService:
-    def __init__(self, store: JsonReminderStore, timezone: ZoneInfo) -> None:
+    def __init__(self, store: Any, timezone: ZoneInfo) -> None:
         self.store = store
         self.timezone = timezone
 
@@ -163,21 +163,6 @@ class ReminderService:
         if updated is None:
             raise ReminderInputError("That reminder could not be found.")
         return updated
-
-    def advance_recurrence(self, reminder: Reminder) -> Reminder | None:
-        if reminder.recurrence_frequency == "none":
-            return None
-        next_due = next_recurrence_datetime(
-            reminder.due_datetime,
-            reminder.recurrence_frequency,
-            reminder.recurrence_interval,
-        )
-        end_at = reminder.recurrence_end_datetime
-        if end_at is not None and next_due > end_at:
-            return None
-        return self.store.update_deadline_for_user(
-            reminder.id, reminder.user_id, next_due.isoformat()
-        )
 
     def _new_id(self) -> str:
         for _ in range(20):

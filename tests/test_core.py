@@ -1,7 +1,5 @@
-import tempfile
 import unittest
 from datetime import datetime
-from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from reminder_bot.models import UserSettings
@@ -14,7 +12,7 @@ from reminder_bot.service import (
     parse_add_arguments,
     parse_daily_time,
 )
-from reminder_bot.storage import JsonReminderStore, JsonUserSettingsStore
+from tests.fakes import InMemoryReminderStore, InMemoryUserSettingsStore
 
 
 SGT = ZoneInfo("Asia/Singapore")
@@ -214,19 +212,16 @@ class ReminderCoreTests(unittest.TestCase):
         self.assertEqual((monthly.month, monthly.day), (2, 28))
 
     def test_conversation_matches_homework_for_completion(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            service = ReminderService(
-                JsonReminderStore(Path(directory) / "reminders.json"), SGT
-            )
-            reminder = service.create(
-                user_id=7,
-                chat_id=7,
-                arguments=["2026-08-25", "Finish science homework"],
-                now=datetime(2026, 8, 19, 12, 0, tzinfo=SGT),
-            )
-            self.assertEqual(
-                find_matching_reminders(service, 7, "science homework"), [reminder]
-            )
+        service = ReminderService(InMemoryReminderStore(), SGT)
+        reminder = service.create(
+            user_id=7,
+            chat_id=7,
+            arguments=["2026-08-25", "Finish science homework"],
+            now=datetime(2026, 8, 19, 12, 0, tzinfo=SGT),
+        )
+        self.assertEqual(
+            find_matching_reminders(service, 7, "science homework"), [reminder]
+        )
 
     def test_daily_time_parser(self) -> None:
         self.assertEqual(parse_daily_time("08:30").strftime("%H:%M"), "08:30")
@@ -234,16 +229,15 @@ class ReminderCoreTests(unittest.TestCase):
             parse_daily_time("25:00")
 
     def test_user_daily_settings_are_independent(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            store = JsonUserSettingsStore(Path(directory) / "settings.json")
-            first = UserSettings(1, 101, "08:00")
-            second = UserSettings(2, 202, "18:30")
-            store.save(first)
-            store.save(second)
-            self.assertEqual(store.get(1), first)
-            self.assertEqual(store.get(2), second)
-            store.save(UserSettings(1, 101, "08:00", daily_enabled=False))
-            self.assertEqual(store.list_enabled(), [second])
+        store = InMemoryUserSettingsStore()
+        first = UserSettings(1, 101, "08:00")
+        second = UserSettings(2, 202, "18:30")
+        store.save(first)
+        store.save(second)
+        self.assertEqual(store.get(1), first)
+        self.assertEqual(store.get(2), second)
+        store.save(UserSettings(1, 101, "08:00", daily_enabled=False))
+        self.assertEqual(store.list_enabled(), [second])
 
     def test_parser_accepts_date_with_default_time(self) -> None:
         due, text = parse_add_arguments(["2026-08-25", "Submit", "assignment"], SGT)
@@ -256,103 +250,96 @@ class ReminderCoreTests(unittest.TestCase):
         self.assertEqual(text, "Dentist")
 
     def test_create_list_and_delete_are_scoped_to_user(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            store = JsonReminderStore(Path(directory) / "reminders.json")
-            service = ReminderService(store, SGT)
-            now = datetime(2026, 8, 19, 12, 0, tzinfo=SGT)
-            created = service.create(
-                user_id=1,
-                chat_id=10,
-                arguments=["2026-08-25", "Task"],
-                now=now,
-            )
-            self.assertEqual([created], store.list_for_user(1))
-            self.assertEqual([], store.list_for_user(2))
-            self.assertFalse(store.delete_for_user(created.id, 2))
-            self.assertTrue(store.delete_for_user(created.id, 1))
-            self.assertEqual([], store.list_for_user(1))
+        store = InMemoryReminderStore()
+        service = ReminderService(store, SGT)
+        now = datetime(2026, 8, 19, 12, 0, tzinfo=SGT)
+        created = service.create(
+            user_id=1,
+            chat_id=10,
+            arguments=["2026-08-25", "Task"],
+            now=now,
+        )
+        self.assertEqual([created], store.list_for_user(1))
+        self.assertEqual([], store.list_for_user(2))
+        self.assertFalse(store.delete_for_user(created.id, 2))
+        self.assertTrue(store.delete_for_user(created.id, 1))
+        self.assertEqual([], store.list_for_user(1))
 
     def test_delete_all_only_removes_requesting_users_active_reminders(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            store = JsonReminderStore(Path(directory) / "reminders.json")
-            service = ReminderService(store, SGT)
-            now = datetime(2026, 8, 19, 12, 0, tzinfo=SGT)
-            first = service.create(
-                user_id=1, chat_id=10, arguments=["2026-08-25", "First"], now=now
-            )
-            second = service.create(
-                user_id=1, chat_id=10, arguments=["2026-08-26", "Second"], now=now
-            )
-            other = service.create(
-                user_id=2, chat_id=20, arguments=["2026-08-27", "Other"], now=now
-            )
-            removed = store.delete_active_for_user(1, now)
-            self.assertEqual({item.id for item in removed}, {first.id, second.id})
-            self.assertEqual([], store.list_for_user(1, now))
-            self.assertEqual([other], store.list_for_user(2, now))
+        store = InMemoryReminderStore()
+        service = ReminderService(store, SGT)
+        now = datetime(2026, 8, 19, 12, 0, tzinfo=SGT)
+        first = service.create(
+            user_id=1, chat_id=10, arguments=["2026-08-25", "First"], now=now
+        )
+        second = service.create(
+            user_id=1, chat_id=10, arguments=["2026-08-26", "Second"], now=now
+        )
+        other = service.create(
+            user_id=2, chat_id=20, arguments=["2026-08-27", "Other"], now=now
+        )
+        removed = store.delete_active_for_user(1, now)
+        self.assertEqual({item.id for item in removed}, {first.id, second.id})
+        self.assertEqual([], store.list_for_user(1, now))
+        self.assertEqual([other], store.list_for_user(2, now))
 
     def test_deadline_update_is_user_scoped(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            store = JsonReminderStore(Path(directory) / "reminders.json")
-            service = ReminderService(store, SGT)
-            now = datetime(2026, 8, 19, 12, 0, tzinfo=SGT)
-            reminder = service.create(
-                user_id=1,
-                chat_id=10,
-                arguments=["2026-08-28", "IDP assignment"],
-                now=now,
+        store = InMemoryReminderStore()
+        service = ReminderService(store, SGT)
+        now = datetime(2026, 8, 19, 12, 0, tzinfo=SGT)
+        reminder = service.create(
+            user_id=1,
+            chat_id=10,
+            arguments=["2026-08-28", "IDP assignment"],
+            now=now,
+        )
+        updated = service.update_deadline(
+            reminder=reminder,
+            user_id=1,
+            due_at=datetime(2026, 8, 24, 23, 59, tzinfo=SGT),
+            now=now,
+        )
+        self.assertEqual(updated.id, reminder.id)
+        self.assertEqual(updated.text, "IDP assignment")
+        self.assertEqual(updated.due_datetime.day, 24)
+        self.assertIsNone(
+            store.update_deadline_for_user(
+                reminder.id, 2, "2026-08-25T23:59:00+08:00"
             )
-            updated = service.update_deadline(
-                reminder=reminder,
-                user_id=1,
-                due_at=datetime(2026, 8, 24, 23, 59, tzinfo=SGT),
-                now=now,
-            )
-            self.assertEqual(updated.id, reminder.id)
-            self.assertEqual(updated.text, "IDP assignment")
-            self.assertEqual(updated.due_datetime.day, 24)
-            self.assertIsNone(
-                store.update_deadline_for_user(
-                    reminder.id, 2, "2026-08-25T23:59:00+08:00"
-                )
-            )
+        )
 
     def test_rejects_past_reminder(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            service = ReminderService(
-                JsonReminderStore(Path(directory) / "reminders.json"), SGT
+        service = ReminderService(InMemoryReminderStore(), SGT)
+        with self.assertRaises(ReminderInputError):
+            service.create(
+                user_id=1,
+                chat_id=1,
+                arguments=["2026-08-18", "Too late"],
+                now=datetime(2026, 8, 19, 12, 0, tzinfo=SGT),
             )
-            with self.assertRaises(ReminderInputError):
-                service.create(
-                    user_id=1,
-                    chat_id=1,
-                    arguments=["2026-08-18", "Too late"],
-                    now=datetime(2026, 8, 19, 12, 0, tzinfo=SGT),
-                )
 
     def test_old_list_and_seven_day_purge(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            store = JsonReminderStore(Path(directory) / "reminders.json")
-            service = ReminderService(store, SGT)
-            old = service.create(
-                user_id=1,
-                chat_id=1,
-                arguments=["2026-08-20", "Old task"],
-                now=datetime(2026, 8, 19, 12, 0, tzinfo=SGT),
-            )
-            future = service.create(
-                user_id=1,
-                chat_id=1,
-                arguments=["2026-09-20", "Future task"],
-                now=datetime(2026, 8, 19, 12, 0, tzinfo=SGT),
-            )
-            six_days_later = datetime(2026, 8, 26, 12, 0, tzinfo=SGT)
-            eight_days_later = datetime(2026, 8, 28, 12, 0, tzinfo=SGT)
-            self.assertEqual(store.list_old_for_user(1, six_days_later), [old])
-            self.assertEqual(store.list_for_user(1, six_days_later), [future])
-            self.assertEqual(store.purge_old(six_days_later), 0)
-            self.assertEqual(store.purge_old(eight_days_later), 1)
-            self.assertEqual(store.list_for_user(1, eight_days_later), [future])
+        store = InMemoryReminderStore()
+        service = ReminderService(store, SGT)
+        old = service.create(
+            user_id=1,
+            chat_id=1,
+            arguments=["2026-08-20", "Old task"],
+            now=datetime(2026, 8, 19, 12, 0, tzinfo=SGT),
+        )
+        future = service.create(
+            user_id=1,
+            chat_id=1,
+            arguments=["2026-09-20", "Future task"],
+            now=datetime(2026, 8, 19, 12, 0, tzinfo=SGT),
+        )
+        six_days_later = datetime(2026, 8, 26, 12, 0, tzinfo=SGT)
+        eight_days_later = datetime(2026, 8, 28, 12, 0, tzinfo=SGT)
+        self.assertEqual(store.list_old_for_user(1, six_days_later), [old])
+        self.assertEqual(store.list_for_user(1, six_days_later), [future])
+        self.assertEqual(store.purge_old(six_days_later), 0)
+        self.assertEqual(store.purge_old(eight_days_later), 1)
+        self.assertEqual(store.list_for_user(1, eight_days_later), [future])
 
 
 if __name__ == "__main__":

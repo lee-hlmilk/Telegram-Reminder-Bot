@@ -57,6 +57,7 @@ class UserSettings:
     chat_id: int
     daily_time: str
     daily_enabled: bool = True
+    last_daily_sent_on: str | None = None
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "UserSettings":
@@ -65,6 +66,11 @@ class UserSettings:
             chat_id=int(value["chat_id"]),
             daily_time=str(value["daily_time"]),
             daily_enabled=bool(value.get("daily_enabled", True)),
+            last_daily_sent_on=(
+                str(value["last_daily_sent_on"])
+                if value.get("last_daily_sent_on") is not None
+                else None
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
