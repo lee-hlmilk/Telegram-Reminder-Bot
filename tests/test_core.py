@@ -3,6 +3,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from reminder_bot.models import UserSettings
+from reminder_bot.models import Reminder
 from reminder_bot.llm import IntentInterpretationError, IntentOutput, OpenAIIntentInterpreter
 from reminder_bot.conversation import find_matching_reminders
 from reminder_bot.service import (
@@ -19,6 +20,18 @@ SGT = ZoneInfo("Asia/Singapore")
 
 
 class ReminderCoreTests(unittest.TestCase):
+    def test_firestore_utc_timestamp_converts_back_to_singapore_time(self) -> None:
+        reminder = Reminder(
+            id="abc123",
+            user_id=1,
+            chat_id=1,
+            text="Submit assignment",
+            due_at="2026-08-21T15:59:00+00:00",
+            created_at="2026-08-19T12:00:00+00:00",
+        )
+        local_due = reminder.due_datetime.astimezone(SGT)
+        self.assertEqual(local_due.strftime("%Y-%m-%d %H:%M"), "2026-08-21 23:59")
+
     def test_llm_output_is_validated_before_becoming_an_intent(self) -> None:
         interpreter = OpenAIIntentInterpreter(
             api_key="test-key", model="test", timezone=SGT

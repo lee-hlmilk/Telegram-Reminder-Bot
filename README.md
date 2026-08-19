@@ -58,6 +58,12 @@ checked-in `.env` file.
 
 Cloud Run starts the service using the command defined in `Dockerfile`.
 
+Redeploy saved changes from Cloud Shell with:
+
+```bash
+bash deploy.sh
+```
+
 ## Tests
 
 Install the dependencies, then run:

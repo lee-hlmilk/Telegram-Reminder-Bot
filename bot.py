@@ -53,7 +53,7 @@ def format_reminder_list(service: ReminderService, user_id: int, title: str) -> 
 
     lines = [f"*{escape_markdown(title, version=2)}*"]
     for index, reminder in enumerate(reminders, start=1):
-        due = reminder.due_datetime
+        due = reminder.due_datetime.astimezone(service.timezone)
         lines.extend(
             [
                 "",
@@ -76,7 +76,10 @@ def format_reminder_list(service: ReminderService, user_id: int, title: str) -> 
                 else f"🔁 _Every {interval} {unit}s"
             )
             if reminder.recurrence_end_datetime is not None:
-                repeat += f" until {reminder.recurrence_end_datetime:%d %b %Y}"
+                recurrence_end = reminder.recurrence_end_datetime.astimezone(
+                    service.timezone
+                )
+                repeat += f" until {recurrence_end:%d %b %Y}"
             repeat += "_"
             lines.append(repeat)
     return "\n".join(lines)
@@ -92,7 +95,7 @@ def format_old_reminder_list(service: ReminderService, user_id: int) -> str:
         "_Automatically removed 7 days after the deadline\\._",
     ]
     for index, reminder in enumerate(reminders, start=1):
-        due = reminder.due_datetime
+        due = reminder.due_datetime.astimezone(service.timezone)
         label = "✅ Completed" if reminder.status == "completed" else "⌛ Expired"
         lines.extend(
             [
@@ -183,7 +186,7 @@ def build_application(
             except ReminderInputError as exc:
                 await update.effective_message.reply_text(f"⚠️ {exc}")
                 return
-            due = reminder.due_datetime
+            due = reminder.due_datetime.astimezone(service.timezone)
             await update.effective_message.reply_text(
                 "✅ Reminder created!\n\n"
                 f"📌 {reminder.text}\n"
@@ -195,7 +198,8 @@ def build_application(
                     else ""
                 )
                 + (
-                    f"\n🛑 Until {reminder.recurrence_end_datetime:%d %b %Y}"
+                    "\n🛑 Until "
+                    f"{reminder.recurrence_end_datetime.astimezone(service.timezone):%d %b %Y}"
                     if reminder.recurrence_end_datetime is not None
                     else ""
                 )
@@ -302,7 +306,8 @@ def build_application(
                     "using its title or date:"
                 ]
                 choices.extend(
-                    f"• {item.text} — {item.due_datetime:%d %b}"
+                    f"• {item.text} — "
+                    f"{item.due_datetime.astimezone(service.timezone):%d %b}"
                     for item in matches
                 )
                 await update.effective_message.reply_text("\n".join(choices))
@@ -329,7 +334,7 @@ def build_application(
                     return
                 reply = (
                     f"✅ I moved “{updated.text}” to "
-                    f"{updated.due_datetime:%d %b %Y at %H:%M}."
+                    f"{updated.due_datetime.astimezone(service.timezone):%d %b %Y at %H:%M}."
                 )
             await update.effective_message.reply_text(reply)
             return
