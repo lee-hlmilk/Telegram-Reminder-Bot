@@ -136,9 +136,13 @@ class OpenAIIntentInterpreter:
             "Questions such as 'when is my daily reminder?', 'what time is my daily "
             "summary?', and 'are daily reminders on?' mean settings. Use unknown only "
             "when none of the supported meanings fit. "
-            "Listing examples such as 'what is in my reminders?', 'what do I have coming "
-            "up?', 'show my schedule', 'anything on my reminder list?', and 'what have I "
-            "got planned?' all mean list. 'Show my old reminders', 'what did I miss?', and "
+            "A request to tell, show, read, list, or describe the user's reminders means "
+            "list even when it is phrased as a short question or does not contain the word "
+            "list. Exact examples 'tell me my reminders', 'show me my reminders', 'what "
+            "are my reminders?', 'what is in my reminders?', 'list my reminders', 'what do "
+            "I have coming up?', 'show my schedule', 'anything on my reminder list?', and "
+            "'what have I got planned?' all mean list with high confidence. These are not "
+            "chat, settings, or unknown. 'Show my old reminders', 'what did I miss?', and "
             "'what reminders have passed?' mean old. "
             "Only use delete_all when the user explicitly applies a comprehensive word "
             "such as all, every, clear, empty, or wipe to their reminders. Examples: "
@@ -180,7 +184,12 @@ class OpenAIIntentInterpreter:
     def _to_intent(
         self, value: IntentOutput, current: datetime | None = None
     ) -> ConversationIntent:
-        minimum_confidence = 0.4 if value.action == "chat" else self.minimum_confidence
+        # Read-only requests are safe to honor at a lower confidence than mutations.
+        minimum_confidence = (
+            0.4
+            if value.action in {"chat", "list", "old", "settings"}
+            else self.minimum_confidence
+        )
         if not math.isfinite(value.confidence) or value.confidence < minimum_confidence:
             raise IntentInterpretationError("The request was too ambiguous")
 

@@ -77,10 +77,34 @@ class ReminderCoreTests(unittest.TestCase):
             api_key="test-key", model="test", timezone=SGT
         )
         prompt = interpreter._instructions(datetime(2026, 8, 19, 19, 59, tzinfo=SGT))
+        self.assertIn("tell me my reminders", prompt)
+        self.assertIn("show me my reminders", prompt)
+        self.assertIn("what are my reminders?", prompt)
         self.assertIn("what is in my reminders?", prompt)
         self.assertIn("clear my reminders", prompt)
         self.assertIn("delete_all", prompt)
         self.assertIn("when is my daily reminder?", prompt)
+
+    def test_read_only_list_intent_accepts_moderate_confidence(self) -> None:
+        interpreter = OpenAIIntentInterpreter(
+            api_key="test-key", model="test", timezone=SGT
+        )
+        intent = interpreter._to_intent(
+            IntentOutput(
+                action="list",
+                title="",
+                due_at=None,
+                trigger_phrase=None,
+                daily_time=None,
+                daily_enabled=None,
+                reply="",
+                recurrence_frequency="none",
+                recurrence_interval=1,
+                recurrence_end_at=None,
+                confidence=0.5,
+            )
+        )
+        self.assertEqual(intent.action, "list")
 
     def test_prompt_separates_repeating_reminder_from_daily_summary(self) -> None:
         interpreter = OpenAIIntentInterpreter(
