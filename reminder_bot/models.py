@@ -1,8 +1,18 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Any
+
+
+@dataclass(frozen=True, slots=True)
+class ChecklistItem:
+    text: str
+    completed: bool = False
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "ChecklistItem":
+        return cls(text=str(value["text"]), completed=bool(value.get("completed", False)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -17,6 +27,8 @@ class Reminder:
     recurrence_frequency: str = "none"
     recurrence_interval: int = 1
     recurrence_end_at: str | None = None
+    note: str = ""
+    checklist: tuple[ChecklistItem, ...] = field(default_factory=tuple)
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "Reminder":
@@ -34,6 +46,12 @@ class Reminder:
                 str(value["recurrence_end_at"])
                 if value.get("recurrence_end_at") is not None
                 else None
+            ),
+            note=str(value.get("note", "")),
+            checklist=tuple(
+                ChecklistItem.from_dict(item)
+                for item in value.get("checklist", [])
+                if isinstance(item, dict) and item.get("text")
             ),
         )
 
@@ -58,6 +76,7 @@ class UserSettings:
     daily_time: str
     daily_enabled: bool = True
     last_daily_sent_on: str | None = None
+    timezone: str = "Asia/Singapore"
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "UserSettings":
@@ -71,6 +90,7 @@ class UserSettings:
                 if value.get("last_daily_sent_on") is not None
                 else None
             ),
+            timezone=str(value.get("timezone", "Asia/Singapore")),
         )
 
     def to_dict(self) -> dict[str, Any]:

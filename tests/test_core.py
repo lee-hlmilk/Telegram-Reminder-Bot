@@ -39,6 +39,55 @@ class ReminderCoreTests(unittest.TestCase):
         local_due = reminder.due_datetime.astimezone(SGT)
         self.assertEqual(local_due.strftime("%Y-%m-%d %H:%M"), "2026-08-21 23:59")
 
+    def test_existing_user_settings_default_to_singapore_timezone(self) -> None:
+        setting = UserSettings.from_dict(
+            {"user_id": 1, "chat_id": 1, "daily_time": "08:00"}
+        )
+        self.assertEqual(setting.timezone, "Asia/Singapore")
+
+    def test_reminder_can_store_notes_and_checklists(self) -> None:
+        store = InMemoryReminderStore()
+        service = ReminderService(store, SGT)
+        reminder = service.create_at(
+            user_id=1,
+            chat_id=1,
+            due_at=datetime(2026, 8, 21, 17, 0, tzinfo=SGT),
+            text="Prepare for trip",
+            note="Bring the blue suitcase",
+            checklist_items=("Passport", "Charger"),
+            now=datetime(2026, 8, 20, 12, 0, tzinfo=SGT),
+        )
+        self.assertEqual(reminder.note, "Bring the blue suitcase")
+        self.assertEqual([item.text for item in reminder.checklist], ["Passport", "Charger"])
+        completed = store.complete_checklist_item_for_user(
+            reminder.id, 1, "passport"
+        )
+        self.assertEqual(completed[1], "Passport")
+
+    def test_intent_uses_the_users_timezone(self) -> None:
+        interpreter = OpenAIIntentInterpreter(
+            api_key="test-key", model="test", timezone=SGT
+        )
+        tokyo = ZoneInfo("Asia/Tokyo")
+        intent = interpreter._to_intent(
+            IntentOutput(
+                action="create",
+                title="Call home",
+                due_at="2026-08-21T17:00:00",
+                trigger_phrase="tomorrow at 5pm",
+                daily_time=None,
+                daily_enabled=None,
+                reply="",
+                recurrence_frequency="none",
+                recurrence_interval=1,
+                recurrence_end_at=None,
+                confidence=0.95,
+            ),
+            datetime(2026, 8, 20, 12, 0, tzinfo=tokyo),
+            tokyo,
+        )
+        self.assertEqual(intent.due_at.utcoffset(), tokyo.utcoffset(intent.due_at))
+
     def test_llm_output_is_validated_before_becoming_an_intent(self) -> None:
         interpreter = OpenAIIntentInterpreter(
             api_key="test-key", model="test", timezone=SGT

@@ -6,7 +6,7 @@ from datetime import datetime, time, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .models import Reminder
+from .models import ChecklistItem, Reminder
 
 
 class ReminderInputError(ValueError):
@@ -17,7 +17,7 @@ def get_timezone(name: str) -> ZoneInfo:
     try:
         return ZoneInfo(name)
     except ZoneInfoNotFoundError as exc:
-        raise RuntimeError(f"Unknown BOT_TIMEZONE: {name}") from exc
+        raise RuntimeError(f"Unknown timezone: {name}") from exc
 
 
 def parse_add_arguments(arguments: list[str], timezone: ZoneInfo) -> tuple[datetime, str]:
@@ -92,6 +92,8 @@ class ReminderService:
         recurrence_frequency: str = "none",
         recurrence_interval: int = 1,
         recurrence_end_at: datetime | None = None,
+        note: str = "",
+        checklist_items: tuple[str, ...] = (),
         now: datetime | None = None,
     ) -> Reminder:
         current_time = now or datetime.now(self.timezone)
@@ -117,6 +119,14 @@ class ReminderService:
                 recurrence_end_at = recurrence_end_at.astimezone(self.timezone)
             if recurrence_end_at < due_at:
                 raise ReminderInputError("The repeat end must follow its first reminder.")
+        note = note.strip()
+        if len(note) > 2000:
+            raise ReminderInputError("Reminder notes must be 2,000 characters or fewer.")
+        cleaned_items = tuple(item.strip() for item in checklist_items if item.strip())
+        if len(cleaned_items) > 30:
+            raise ReminderInputError("A reminder can have at most 30 checklist items.")
+        if any(len(item) > 300 for item in cleaned_items):
+            raise ReminderInputError("Checklist items must be 300 characters or fewer.")
 
         reminder_id = self._new_id()
         reminder = Reminder(
@@ -131,6 +141,8 @@ class ReminderService:
             recurrence_end_at=(
                 recurrence_end_at.isoformat() if recurrence_end_at is not None else None
             ),
+            note=note,
+            checklist=tuple(ChecklistItem(item) for item in cleaned_items),
         )
         self.store.add(reminder)
         return reminder

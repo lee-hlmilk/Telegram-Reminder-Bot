@@ -27,11 +27,20 @@ The application has no polling mode and does not use local JSON storage.
 - `Clear my reminders`
 - `Send my daily summary at 8:30am`
 - `Turn off my daily summary`
+- `I’m in London — use my local timezone`
+- `Add a note to my trip reminder to bring the blue suitcase`
+- `Remind me Friday to prepare for my trip: passport, charger`
+- `I packed the charger for my trip`
 
 Remi can use short follow-ups such as `make that 5pm` or `move it to tomorrow`.
 When details are ambiguous, it asks a focused question instead of failing.
 Deleting one reminder or clearing all reminders requires an explicit yes/no
 confirmation.
+
+Daily summaries are grouped into overdue, today, tomorrow, the next seven days,
+and later. Reminder notes and checklist progress appear in lists, summaries, and
+deadline notifications. User settings store an IANA timezone; older settings
+without one continue to default to `Asia/Singapore`.
 
 Daily summaries are enabled for new users at `08:00` by default. Completed and
 expired reminders move to the old list and are purged seven days after their

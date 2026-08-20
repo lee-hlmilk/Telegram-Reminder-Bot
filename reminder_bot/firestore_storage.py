@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+from dataclasses import asdict
 from datetime import datetime, timedelta
 from typing import Any
 
 from google.cloud import firestore
 from google.cloud.firestore_v1.base_query import FieldFilter
 
-from .models import Reminder, UserSettings
+from .models import ChecklistItem, Reminder, UserSettings
 
 
 def _as_datetime(value: Any) -> datetime | None:
@@ -35,6 +36,12 @@ def _reminder_from_document(document: Any) -> Reminder:
         recurrence_frequency=str(value.get("recurrence_frequency", "none")),
         recurrence_interval=int(value.get("recurrence_interval", 1)),
         recurrence_end_at=(recurrence_end.isoformat() if recurrence_end else None),
+        note=str(value.get("note", "")),
+        checklist=tuple(
+            ChecklistItem.from_dict(item)
+            for item in value.get("checklist", [])
+            if isinstance(item, dict) and item.get("text")
+        ),
     )
 
 
@@ -57,6 +64,8 @@ def _reminder_data(reminder: Reminder) -> dict[str, Any]:
         "recurrence_frequency": reminder.recurrence_frequency,
         "recurrence_interval": reminder.recurrence_interval,
         "recurrence_end_at": reminder.recurrence_end_datetime,
+        "note": reminder.note,
+        "checklist": [asdict(item) for item in reminder.checklist],
         "purge_at": _purge_at(reminder),
         "lease_until": None,
         "advance_notice_60_for": None,
@@ -194,6 +203,8 @@ class FirestoreReminderStore:
                 recurrence_frequency=reminder.recurrence_frequency,
                 recurrence_interval=reminder.recurrence_interval,
                 recurrence_end_at=reminder.recurrence_end_at,
+                note=reminder.note,
+                checklist=reminder.checklist,
             )
             transaction.update(
                 reference,
@@ -207,6 +218,85 @@ class FirestoreReminderStore:
                 },
             )
             return updated
+
+        return update(transaction)
+
+    def set_note_for_user(
+        self, reminder_id: str, user_id: int, note: str
+    ) -> Reminder | None:
+        reference = self.collection.document(reminder_id)
+        transaction = self.client.transaction()
+
+        @firestore.transactional
+        def update(transaction: Any) -> Reminder | None:
+            document = reference.get(transaction=transaction)
+            if not document.exists or int(document.get("user_id")) != user_id:
+                return None
+            transaction.update(reference, {"note": note})
+            reminder = _reminder_from_document(document)
+            return Reminder(
+                id=reminder.id, user_id=reminder.user_id, chat_id=reminder.chat_id,
+                text=reminder.text, due_at=reminder.due_at,
+                created_at=reminder.created_at, status=reminder.status,
+                recurrence_frequency=reminder.recurrence_frequency,
+                recurrence_interval=reminder.recurrence_interval,
+                recurrence_end_at=reminder.recurrence_end_at, note=note,
+                checklist=reminder.checklist,
+            )
+
+        return update(transaction)
+
+    def complete_checklist_item_for_user(
+        self, reminder_id: str, user_id: int, item_query: str
+    ) -> tuple[Reminder, str] | None:
+        reference = self.collection.document(reminder_id)
+        transaction = self.client.transaction()
+
+        @firestore.transactional
+        def update(transaction: Any) -> tuple[Reminder, str] | None:
+            document = reference.get(transaction=transaction)
+            if not document.exists or int(document.get("user_id")) != user_id:
+                return None
+            reminder = _reminder_from_document(document)
+            query = item_query.casefold().strip()
+            matches = [
+                index for index, item in enumerate(reminder.checklist)
+                if query in item.text.casefold() or item.text.casefold() in query
+            ]
+            if len(matches) != 1:
+                return None
+            index = matches[0]
+            completed_text = reminder.checklist[index].text
+            checklist = tuple(
+                ChecklistItem(item.text, True) if position == index else item
+                for position, item in enumerate(reminder.checklist)
+            )
+            transaction.update(
+                reference, {"checklist": [asdict(item) for item in checklist]}
+            )
+            return reminder, completed_text
+
+        return update(transaction)
+
+    def add_checklist_item_for_user(
+        self, reminder_id: str, user_id: int, item_text: str
+    ) -> Reminder | None:
+        reference = self.collection.document(reminder_id)
+        transaction = self.client.transaction()
+
+        @firestore.transactional
+        def update(transaction: Any) -> Reminder | None:
+            document = reference.get(transaction=transaction)
+            if not document.exists or int(document.get("user_id")) != user_id:
+                return None
+            reminder = _reminder_from_document(document)
+            if len(reminder.checklist) >= 30:
+                return None
+            checklist = (*reminder.checklist, ChecklistItem(item_text))
+            transaction.update(
+                reference, {"checklist": [asdict(item) for item in checklist]}
+            )
+            return reminder
 
         return update(transaction)
 
@@ -369,6 +459,8 @@ class FirestoreReminderStore:
             recurrence_frequency=reminder.recurrence_frequency,
             recurrence_interval=reminder.recurrence_interval,
             recurrence_end_at=reminder.recurrence_end_at,
+            note=reminder.note,
+            checklist=reminder.checklist,
         )
         reference.update(
             {

@@ -21,6 +21,10 @@ class ConversationIntent:
     recurrence_frequency: str = "none"
     recurrence_interval: int = 1
     recurrence_end_at: datetime | None = None
+    note: str = ""
+    checklist_items: tuple[str, ...] = ()
+    checklist_item: str = ""
+    timezone_name: str = ""
 
 
 def find_matching_reminders(

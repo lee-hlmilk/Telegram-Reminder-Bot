@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-from reminder_bot.models import Reminder, UserSettings
+from reminder_bot.models import ChecklistItem, Reminder, UserSettings
 
 
 class InMemoryReminderStore:
@@ -48,6 +48,8 @@ class InMemoryReminderStore:
                     status="active", recurrence_frequency=reminder.recurrence_frequency,
                     recurrence_interval=reminder.recurrence_interval,
                     recurrence_end_at=reminder.recurrence_end_at,
+                    note=reminder.note,
+                    checklist=reminder.checklist,
                 )
                 self.items[index] = updated
                 return updated
@@ -55,6 +57,63 @@ class InMemoryReminderStore:
 
     def id_exists(self, reminder_id: str) -> bool:
         return any(item.id == reminder_id for item in self.items)
+
+    def set_note_for_user(self, reminder_id: str, user_id: int, note: str) -> Reminder | None:
+        for index, reminder in enumerate(self.items):
+            if reminder.id == reminder_id and reminder.user_id == user_id:
+                updated = Reminder(
+                    id=reminder.id, user_id=reminder.user_id, chat_id=reminder.chat_id,
+                    text=reminder.text, due_at=reminder.due_at,
+                    created_at=reminder.created_at, status=reminder.status,
+                    recurrence_frequency=reminder.recurrence_frequency,
+                    recurrence_interval=reminder.recurrence_interval,
+                    recurrence_end_at=reminder.recurrence_end_at, note=note,
+                    checklist=reminder.checklist,
+                )
+                self.items[index] = updated
+                return updated
+        return None
+
+    def complete_checklist_item_for_user(self, reminder_id: str, user_id: int, item_query: str):
+        for index, reminder in enumerate(self.items):
+            if reminder.id != reminder_id or reminder.user_id != user_id:
+                continue
+            matches = [i for i, item in enumerate(reminder.checklist) if item_query.lower() in item.text.lower()]
+            if len(matches) != 1:
+                return None
+            item_index = matches[0]
+            checklist = tuple(
+                ChecklistItem(item.text, True) if i == item_index else item
+                for i, item in enumerate(reminder.checklist)
+            )
+            self.items[index] = Reminder(
+                id=reminder.id, user_id=reminder.user_id, chat_id=reminder.chat_id,
+                text=reminder.text, due_at=reminder.due_at,
+                created_at=reminder.created_at, status=reminder.status,
+                recurrence_frequency=reminder.recurrence_frequency,
+                recurrence_interval=reminder.recurrence_interval,
+                recurrence_end_at=reminder.recurrence_end_at,
+                note=reminder.note, checklist=checklist,
+            )
+            return reminder, reminder.checklist[item_index].text
+        return None
+
+    def add_checklist_item_for_user(self, reminder_id: str, user_id: int, item_text: str):
+        for index, reminder in enumerate(self.items):
+            if reminder.id == reminder_id and reminder.user_id == user_id:
+                checklist = (*reminder.checklist, ChecklistItem(item_text))
+                self.items[index] = Reminder(
+                    id=reminder.id, user_id=reminder.user_id,
+                    chat_id=reminder.chat_id, text=reminder.text,
+                    due_at=reminder.due_at, created_at=reminder.created_at,
+                    status=reminder.status,
+                    recurrence_frequency=reminder.recurrence_frequency,
+                    recurrence_interval=reminder.recurrence_interval,
+                    recurrence_end_at=reminder.recurrence_end_at,
+                    note=reminder.note, checklist=checklist,
+                )
+                return reminder
+        return None
 
     def purge_old(self, now: datetime | None = None) -> int:
         cutoff = (now or datetime.now().astimezone()) - timedelta(days=7)

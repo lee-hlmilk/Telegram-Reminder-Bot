@@ -3,21 +3,40 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from telegram.ext import Application
 
 from .models import Reminder
-from .service import ReminderService, next_recurrence_datetime, parse_daily_time
+from .service import (
+    ReminderService,
+    get_timezone,
+    next_recurrence_datetime,
+    parse_daily_time,
+)
 
 LOGGER = logging.getLogger(__name__)
 
 
-def next_future_occurrence(reminder: Reminder, now: datetime) -> datetime | None:
+def _details(reminder: Reminder) -> str:
+    lines: list[str] = []
+    if reminder.note:
+        lines.append(f"📝 {reminder.note}")
+    lines.extend(
+        f"{'✅' if item.completed else '☐'} {item.text}"
+        for item in reminder.checklist
+    )
+    return ("\n" + "\n".join(lines)) if lines else ""
+
+
+def next_future_occurrence(
+    reminder: Reminder, now: datetime, timezone: ZoneInfo
+) -> datetime | None:
     """Advance past missed occurrences without flooding the user after downtime."""
     if reminder.recurrence_frequency == "none":
         return None
     candidate = next_recurrence_datetime(
-        reminder.due_datetime,
+        reminder.due_datetime.astimezone(timezone),
         reminder.recurrence_frequency,
         reminder.recurrence_interval,
     )
@@ -51,7 +70,11 @@ async def process_cloud_work(
             now, lead_minutes=warning_minutes
         )
         for reminder in upcoming:
-            due = reminder.due_datetime.astimezone(service.timezone)
+            setting = settings_store.get(reminder.user_id)
+            user_timezone = get_timezone(
+                setting.timezone if setting else service.timezone.key
+            )
+            due = reminder.due_datetime.astimezone(user_timezone)
             if warning_minutes == 60:
                 heading = "⏳ Reminder in 1 hour"
                 urgency = "You have one hour left to get ready."
@@ -66,6 +89,7 @@ async def process_cloud_work(
                         f"📌 {reminder.text}\n"
                         f"⏰ Due at {due:%H:%M}\n"
                         f"{urgency}"
+                        f"{_details(reminder)}"
                     ),
                 )
                 upcoming_sent += 1
@@ -83,10 +107,18 @@ async def process_cloud_work(
     claimed = reminder_store.claim_due(now)
     sent = 0
     for reminder in claimed:
+        setting = settings_store.get(reminder.user_id)
+        user_timezone = get_timezone(
+            setting.timezone if setting else service.timezone.key
+        )
+        due = reminder.due_datetime.astimezone(user_timezone)
         try:
             await application.bot.send_message(
                 chat_id=reminder.chat_id,
-                text=f"🔔 Reminder\n\n📌 {reminder.text}",
+                text=(
+                    f"🔔 Reminder due now\n\n📌 {reminder.text}\n"
+                    f"⏰ {due:%H:%M}{_details(reminder)}"
+                ),
             )
         except Exception:
             failed += 1
@@ -94,14 +126,16 @@ async def process_cloud_work(
             reminder_store.release_claim(reminder.id)
             continue
         reminder_store.finish_delivery(
-            reminder, next_future_occurrence(reminder, now)
+            reminder, next_future_occurrence(reminder, now, user_timezone)
         )
         sent += 1
 
     summaries = 0
-    date_key = now.date().isoformat()
     for setting in settings_store.list_enabled():
-        if now.time().replace(tzinfo=None) < parse_daily_time(setting.daily_time):
+        user_timezone = get_timezone(setting.timezone)
+        local_now = now.astimezone(user_timezone)
+        date_key = local_now.date().isoformat()
+        if local_now.time().replace(tzinfo=None) < parse_daily_time(setting.daily_time):
             continue
         claimed_setting = settings_store.claim_daily_summary(
             setting.user_id, date_key
@@ -110,12 +144,15 @@ async def process_cloud_work(
             continue
         try:
             # Imported lazily to avoid a startup module cycle.
-            from bot import format_reminder_list
+            from bot import format_daily_summary
 
             await application.bot.send_message(
                 chat_id=claimed_setting.chat_id,
-                text=format_reminder_list(
-                    service, claimed_setting.user_id, "☀️ Your daily reminders"
+                text=format_daily_summary(
+                    service,
+                    claimed_setting.user_id,
+                    user_timezone,
+                    now,
                 ),
                 parse_mode="MarkdownV2",
             )

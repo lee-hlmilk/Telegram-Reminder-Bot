@@ -26,6 +26,10 @@ class IntentOutput(BaseModel):
         "old",
         "set_daily",
         "settings",
+        "set_timezone",
+        "add_note",
+        "add_checklist_item",
+        "check_item",
         "chat",
         "unknown",
     ]
@@ -39,6 +43,10 @@ class IntentOutput(BaseModel):
     recurrence_interval: int = Field(ge=1, le=365)
     recurrence_end_at: str | None
     confidence: float = Field(ge=0, le=1)
+    note: str | None = None
+    checklist_items: list[str] = Field(default_factory=list)
+    checklist_item: str | None = None
+    timezone_name: str | None = None
 
 
 class ClarificationOutput(BaseModel):
@@ -81,23 +89,26 @@ class OpenAIIntentInterpreter:
         message: str,
         now: datetime | None = None,
         history: list[dict[str, str]] | None = None,
+        timezone: ZoneInfo | None = None,
     ) -> ConversationIntent:
-        current = now or datetime.now(self.timezone)
+        effective_timezone = timezone or self.timezone
+        current = now or datetime.now(effective_timezone)
         try:
             output = await asyncio.to_thread(
-                self._request, message, current, history or []
+                self._request, message, current, history or [], effective_timezone
             )
         except OpenAIError as exc:
             raise LLMUnavailableError("OpenAI request failed") from exc
-        return self._to_intent(output, current)
+        return self._to_intent(output, current, effective_timezone)
 
     def _request(
         self,
         message: str,
         current: datetime,
         history: list[dict[str, str]],
+        timezone: ZoneInfo,
     ) -> IntentOutput:
-        instructions = self._instructions(current)
+        instructions = self._instructions(current, timezone)
         response = self.client.responses.parse(
             model=self.model,
             input=[
@@ -156,7 +167,10 @@ class OpenAIIntentInterpreter:
             raise IntentInterpretationError("The model did not return a clarification")
         return response.output_parsed
 
-    def _instructions(self, current: datetime) -> str:
+    def _instructions(
+        self, current: datetime, timezone: ZoneInfo | None = None
+    ) -> str:
+        effective_timezone = timezone or self.timezone
         return (
             "Classify the user's message for a reminder bot. Do not execute actions. "
             "Interpret natural, casual English by meaning rather than requiring command "
@@ -168,7 +182,20 @@ class OpenAIIntentInterpreter:
             "time of one named reminder; list to show upcoming active "
             "reminders; old to show reminders past their deadline; set_daily to enable, "
             "change, or disable the daily summary; settings to show the current daily "
-            "summary time and whether it is enabled. "
+            "summary time and whether it is enabled; set_timezone to change the user's "
+            "timezone; add_note to add or replace a note on a named reminder; "
+            "add_checklist_item to add a task to a named reminder; check_item to "
+            "complete one checklist item on a named reminder. "
+            "For set_timezone, return an IANA timezone in timezone_name, such as "
+            "Asia/Singapore, Europe/London, or America/New_York. 'I am in Tokyo' and "
+            "'change my timezone to Tokyo' mean set_timezone with Asia/Tokyo. "
+            "For create, extract optional supporting detail into note and bullet or "
+            "numbered task items into checklist_items. The main reminder title stays "
+            "short. 'Add a note to my trip reminder to bring my passport' means add_note, "
+            "title='trip', note='Bring my passport'. 'I packed the charger for my trip' "
+            "means check_item, title='trip', checklist_item='charger'. 'Add sunscreen "
+            "to my trip checklist' means add_checklist_item, title='trip', and "
+            "checklist_item='sunscreen'. "
             "Repeating reminders are create actions with recurrence_frequency set to "
             "daily, weekly, monthly, or yearly and recurrence_interval set to the number "
             "of those units between occurrences. due_at is the first occurrence. Resolve "
@@ -198,7 +225,8 @@ class OpenAIIntentInterpreter:
             "safely completed. Examples: 'hi', 'hello', 'hey there', 'good morning', 'thanks', "
             "'how are you?', and 'what can you do?' mean chat. "
             "Questions such as 'when is my daily reminder?', 'what time is my daily "
-            "summary?', and 'are daily reminders on?' mean settings. Use unknown when a "
+            "summary?', 'are daily reminders on?', and 'what timezone am I using?' mean "
+            "settings. Use unknown when a "
             "supported request is missing or has conflicting details. For unknown, put "
             "one short and focused clarification question in reply. "
             "A request to tell, show, read, list, or describe the user's reminders means "
@@ -243,12 +271,16 @@ class OpenAIIntentInterpreter:
             "always a string. Use null for nullable fields irrelevant to the action, "
             "including trigger_phrase for actions other than create or update. Do not invent "
             "missing dates, titles, or intentions. "
-            f"Current datetime: {current.isoformat()}. Timezone: {self.timezone.key}."
+            f"Current datetime: {current.isoformat()}. Timezone: {effective_timezone.key}."
         )
 
     def _to_intent(
-        self, value: IntentOutput, current: datetime | None = None
+        self,
+        value: IntentOutput,
+        current: datetime | None = None,
+        timezone: ZoneInfo | None = None,
     ) -> ConversationIntent:
+        effective_timezone = timezone or self.timezone
         # Read-only requests are safe to honor at a lower confidence than mutations.
         minimum_confidence = (
             0.4
@@ -269,9 +301,9 @@ class OpenAIIntentInterpreter:
             except ValueError as exc:
                 raise IntentInterpretationError("The deadline was invalid") from exc
             if due_at.tzinfo is None:
-                due_at = due_at.replace(tzinfo=self.timezone)
+                due_at = due_at.replace(tzinfo=effective_timezone)
             else:
-                due_at = due_at.astimezone(self.timezone)
+                due_at = due_at.astimezone(effective_timezone)
         recurrence_end_at = None
         if value.recurrence_end_at:
             try:
@@ -281,15 +313,15 @@ class OpenAIIntentInterpreter:
             except ValueError as exc:
                 raise IntentInterpretationError("The recurrence end was invalid") from exc
             if recurrence_end_at.tzinfo is None:
-                recurrence_end_at = recurrence_end_at.replace(tzinfo=self.timezone)
+                recurrence_end_at = recurrence_end_at.replace(tzinfo=effective_timezone)
             else:
-                recurrence_end_at = recurrence_end_at.astimezone(self.timezone)
+                recurrence_end_at = recurrence_end_at.astimezone(effective_timezone)
         if due_at is not None and trigger_phrase:
             due_at = _correct_named_weekday(
                 trigger_phrase,
-                current or datetime.now(self.timezone),
+                current or datetime.now(effective_timezone),
                 due_at,
-                self.timezone,
+                effective_timezone,
             )
 
         if value.action == "create" and (
@@ -316,6 +348,21 @@ class OpenAIIntentInterpreter:
                 raise IntentInterpretationError("The daily setting is incomplete")
             if value.daily_enabled and not value.daily_time:
                 raise IntentInterpretationError("The daily reminder time is missing")
+        timezone_name = (value.timezone_name or "").strip()
+        if value.action == "set_timezone" and not timezone_name:
+            raise IntentInterpretationError("The timezone is missing")
+        note = (value.note or "").strip()
+        checklist_item = (value.checklist_item or "").strip()
+        if value.action == "add_note" and (not title or not note):
+            raise IntentInterpretationError("Adding a note needs a reminder and note text")
+        if value.action == "check_item" and (not title or not checklist_item):
+            raise IntentInterpretationError(
+                "Completing a checklist item needs a reminder and item"
+            )
+        if value.action == "add_checklist_item" and (not title or not checklist_item):
+            raise IntentInterpretationError(
+                "Adding a checklist item needs a reminder and item"
+            )
         reply = value.reply.strip()
         if value.action == "chat" and not reply:
             raise IntentInterpretationError("The conversational reply is missing")
@@ -333,6 +380,10 @@ class OpenAIIntentInterpreter:
             recurrence_frequency=value.recurrence_frequency,
             recurrence_interval=value.recurrence_interval,
             recurrence_end_at=recurrence_end_at,
+            note=note,
+            checklist_items=tuple(item.strip() for item in value.checklist_items if item.strip()),
+            checklist_item=checklist_item,
+            timezone_name=timezone_name,
         )
 
 

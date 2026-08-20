@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from telegram import BotCommand, Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
@@ -19,6 +20,7 @@ from reminder_bot.models import UserSettings
 from reminder_bot.service import (
     ReminderInputError,
     ReminderService,
+    get_timezone,
     parse_daily_time,
 )
 
@@ -59,14 +61,28 @@ def confirmation_decision(message: str) -> bool | None:
     return None
 
 
-def format_reminder_list(service: ReminderService, user_id: int, title: str) -> str:
+def _append_reminder_details(lines: list[str], reminder: Any) -> None:
+    if reminder.note:
+        lines.append(f"📝 _{escape_markdown(reminder.note, version=2)}_")
+    for item in reminder.checklist:
+        marker = "✅" if item.completed else "☐"
+        lines.append(f"{marker} {escape_markdown(item.text, version=2)}")
+
+
+def format_reminder_list(
+    service: ReminderService,
+    user_id: int,
+    title: str,
+    timezone: ZoneInfo | None = None,
+) -> str:
     reminders = service.store.list_for_user(user_id)
     if not reminders:
         return "_You have no active reminders\\._"
 
+    display_timezone = timezone or service.timezone
     lines = [f"*{escape_markdown(title, version=2)}*"]
     for index, reminder in enumerate(reminders, start=1):
-        due = reminder.due_datetime.astimezone(service.timezone)
+        due = reminder.due_datetime.astimezone(display_timezone)
         lines.extend(
             [
                 "",
@@ -90,25 +106,29 @@ def format_reminder_list(service: ReminderService, user_id: int, title: str) -> 
             )
             if reminder.recurrence_end_datetime is not None:
                 recurrence_end = reminder.recurrence_end_datetime.astimezone(
-                    service.timezone
+                    display_timezone
                 )
                 repeat += f" until {recurrence_end:%d %b %Y}"
             repeat += "_"
             lines.append(repeat)
+        _append_reminder_details(lines, reminder)
     return "\n".join(lines)
 
 
-def format_old_reminder_list(service: ReminderService, user_id: int) -> str:
+def format_old_reminder_list(
+    service: ReminderService, user_id: int, timezone: ZoneInfo | None = None
+) -> str:
     reminders = service.store.list_old_for_user(user_id)
     if not reminders:
         return "_You have no old reminders\\._"
 
+    display_timezone = timezone or service.timezone
     lines = [
         "*🗃 Your old reminders*",
         "_Automatically removed 7 days after the deadline\\._",
     ]
     for index, reminder in enumerate(reminders, start=1):
-        due = reminder.due_datetime.astimezone(service.timezone)
+        due = reminder.due_datetime.astimezone(display_timezone)
         label = "✅ Completed" if reminder.status == "completed" else "⌛ Expired"
         lines.extend(
             [
@@ -119,6 +139,45 @@ def format_old_reminder_list(service: ReminderService, user_id: int) -> str:
                 f"⏰ _{due:%H:%M}_",
             ]
         )
+        _append_reminder_details(lines, reminder)
+    return "\n".join(lines)
+
+
+def format_daily_summary(
+    service: ReminderService,
+    user_id: int,
+    timezone: ZoneInfo,
+    now: datetime,
+) -> str:
+    local_now = now.astimezone(timezone)
+    today = local_now.date()
+    tomorrow = today + timedelta(days=1)
+    week_end = today + timedelta(days=7)
+    active = service.store.list_for_user(user_id, now)
+    overdue = [
+        item for item in service.store.list_old_for_user(user_id, now)
+        if item.status != "completed" and item.due_datetime <= now
+    ]
+    groups: list[tuple[str, list[Any]]] = [
+        ("🚨 Overdue", overdue),
+        ("📍 Today", [item for item in active if item.due_datetime.astimezone(timezone).date() == today]),
+        ("🌤 Tomorrow", [item for item in active if item.due_datetime.astimezone(timezone).date() == tomorrow]),
+        ("📆 Next 7 days", [item for item in active if tomorrow < item.due_datetime.astimezone(timezone).date() <= week_end]),
+        ("🗓 Later", [item for item in active if item.due_datetime.astimezone(timezone).date() > week_end]),
+    ]
+    if not any(items for _, items in groups):
+        return "*☀️ Daily summary*\n\n_You’re all clear — no reminders need your attention\\._"
+    lines = ["*☀️ Daily summary*", f"_{escape_markdown(timezone.key, version=2)}_"]
+    for heading, items in groups:
+        if not items:
+            continue
+        lines.extend(["", f"*{escape_markdown(heading, version=2)}*"])
+        for reminder in items:
+            due = reminder.due_datetime.astimezone(timezone)
+            lines.append(
+                f"• *{escape_markdown(reminder.text, version=2)}* — _{due:%a %H:%M}_"
+            )
+            _append_reminder_details(lines, reminder)
     return "\n".join(lines)
 
 
@@ -172,7 +231,8 @@ def build_application(
             return
         user_id = update.effective_user.id
         message = update.effective_message.text
-        ensure_daily_default(user_id, update.effective_chat.id)
+        user_setting = ensure_daily_default(user_id, update.effective_chat.id)
+        user_timezone = get_timezone(user_setting.timezone)
         history = conversation_store.history(user_id)
         pending = conversation_store.confirmation(user_id)
         conversation_store.append(user_id, "user", message)
@@ -207,7 +267,9 @@ def build_application(
             # A new request implicitly abandons the old confirmation.
             conversation_store.clear_confirmation(user_id)
         try:
-            intent = await llm_interpreter.interpret(message, history=history)
+            intent = await llm_interpreter.interpret(
+                message, history=history, timezone=user_timezone
+            )
         except LLMUnavailableError:
             LOGGER.exception("OpenAI intent interpretation failed")
             await respond(
@@ -234,11 +296,13 @@ def build_application(
                     recurrence_frequency=intent.recurrence_frequency,
                     recurrence_interval=intent.recurrence_interval,
                     recurrence_end_at=intent.recurrence_end_at,
+                    note=intent.note,
+                    checklist_items=intent.checklist_items,
                 )
             except ReminderInputError as exc:
                 await respond(f"⚠️ {exc}")
                 return
-            due = reminder.due_datetime.astimezone(service.timezone)
+            due = reminder.due_datetime.astimezone(user_timezone)
             await respond(
                 "✅ Reminder created!\n\n"
                 f"📌 {reminder.text}\n"
@@ -251,8 +315,14 @@ def build_application(
                 )
                 + (
                     "\n🛑 Until "
-                    f"{reminder.recurrence_end_datetime.astimezone(service.timezone):%d %b %Y}"
+                    f"{reminder.recurrence_end_datetime.astimezone(user_timezone):%d %b %Y}"
                     if reminder.recurrence_end_datetime is not None
+                    else ""
+                )
+                + (f"\n📝 {reminder.note}" if reminder.note else "")
+                + (
+                    "\n" + "\n".join(f"☐ {item.text}" for item in reminder.checklist)
+                    if reminder.checklist
                     else ""
                 )
             )
@@ -261,7 +331,7 @@ def build_application(
         if intent.action == "list":
             await respond(
                 format_reminder_list(
-                    service, update.effective_user.id, "📋 Your reminders"
+                    service, user_id, "📋 Your reminders", user_timezone
                 ),
                 parse_mode="MarkdownV2",
             )
@@ -269,7 +339,7 @@ def build_application(
 
         if intent.action == "old":
             await respond(
-                format_old_reminder_list(service, update.effective_user.id),
+                format_old_reminder_list(service, user_id, user_timezone),
                 parse_mode="MarkdownV2",
             )
             return
@@ -281,11 +351,36 @@ def build_application(
             if setting.daily_enabled:
                 reply = (
                     f"Your daily reminder is on and arrives at {setting.daily_time} "
-                    f"({service.timezone.key})."
+                    f"({setting.timezone})."
                 )
             else:
-                reply = "Your daily reminder is currently turned off."
+                reply = (
+                    "Your daily reminder is currently turned off. "
+                    f"Your timezone is {setting.timezone}."
+                )
             await respond(reply)
+            return
+
+        if intent.action == "set_timezone":
+            try:
+                new_timezone = get_timezone(intent.timezone_name)
+            except RuntimeError:
+                await respond(
+                    "I couldn’t identify that timezone. Try a city such as Singapore, "
+                    "Tokyo, London, or New York."
+                )
+                return
+            current = settings_store.get(user_id) or user_setting
+            setting = UserSettings(
+                user_id=user_id,
+                chat_id=update.effective_chat.id,
+                daily_time=current.daily_time,
+                daily_enabled=current.daily_enabled,
+                last_daily_sent_on=current.last_daily_sent_on,
+                timezone=new_timezone.key,
+            )
+            settings_store.save(setting)
+            await respond(f"✅ I’ll now use {new_timezone.key} for your reminders.")
             return
 
         if intent.action == "delete_all":
@@ -312,6 +407,7 @@ def build_application(
                     daily_time=current.daily_time if current else default_daily_time,
                     daily_enabled=False,
                     last_daily_sent_on=(current.last_daily_sent_on if current else None),
+                    timezone=(current.timezone if current else user_timezone.key),
                 )
                 settings_store.save(setting)
                 await respond("Daily reminders are disabled.")
@@ -331,11 +427,12 @@ def build_application(
                 daily_time=parsed_time.strftime("%H:%M"),
                 daily_enabled=True,
                 last_daily_sent_on=(current.last_daily_sent_on if current else None),
+                timezone=(current.timezone if current else user_timezone.key),
             )
             settings_store.save(setting)
             await respond(
                 f"✅ Daily reminders will be sent at {setting.daily_time} "
-                f"({service.timezone.key})."
+                f"({setting.timezone})."
             )
             return
 
@@ -343,7 +440,10 @@ def build_application(
             await respond(intent.reply)
             return
 
-        if intent.action in {"delete", "complete", "update"}:
+        if intent.action in {
+            "delete", "complete", "update", "add_note",
+            "add_checklist_item", "check_item",
+        }:
             matches = find_matching_reminders(
                 service, update.effective_user.id, intent.title
             )
@@ -360,7 +460,7 @@ def build_application(
                 ]
                 choices.extend(
                     f"• {item.text} — "
-                    f"{item.due_datetime.astimezone(service.timezone):%d %b}"
+                    f"{item.due_datetime.astimezone(user_timezone):%d %b}"
                     for item in matches
                 )
                 await respond("\n".join(choices))
@@ -384,6 +484,35 @@ def build_application(
                     reminder.id, update.effective_user.id, "completed"
                 )
                 reply = f"✅ Marked “{reminder.text}” as completed."
+            elif intent.action == "add_note":
+                updated = service.store.set_note_for_user(
+                    reminder.id, user_id, intent.note
+                )
+                if updated is None:
+                    await respond("I couldn’t update that reminder’s note.")
+                    return
+                reply = f"📝 Added the note to “{reminder.text}”."
+            elif intent.action == "check_item":
+                completed = service.store.complete_checklist_item_for_user(
+                    reminder.id, user_id, intent.checklist_item
+                )
+                if completed is None:
+                    await respond(
+                        f'I couldn’t find one checklist item matching “{intent.checklist_item}”. '
+                        "Which item did you complete?"
+                    )
+                    return
+                reply = f"✅ Checked off “{completed[1]}” in “{reminder.text}”."
+            elif intent.action == "add_checklist_item":
+                updated = service.store.add_checklist_item_for_user(
+                    reminder.id, user_id, intent.checklist_item
+                )
+                if updated is None:
+                    await respond("I couldn’t add that checklist item.")
+                    return
+                reply = (
+                    f"☐ Added “{intent.checklist_item}” to “{reminder.text}”."
+                )
             else:
                 try:
                     updated = service.update_deadline(
@@ -396,7 +525,7 @@ def build_application(
                     return
                 reply = (
                     f"✅ I moved “{updated.text}” to "
-                    f"{updated.due_datetime.astimezone(service.timezone):%d %b %Y at %H:%M}."
+                    f"{updated.due_datetime.astimezone(user_timezone):%d %b %Y at %H:%M}."
                 )
             await respond(reply)
             return
