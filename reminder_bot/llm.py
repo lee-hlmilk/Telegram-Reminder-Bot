@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import re
 from datetime import datetime, timedelta
@@ -11,6 +12,9 @@ from openai import OpenAI, OpenAIError
 from pydantic import BaseModel, ConfigDict, Field
 
 from .conversation import ConversationIntent
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class IntentOutput(BaseModel):
@@ -109,15 +113,24 @@ class OpenAIIntentInterpreter:
         timezone: ZoneInfo,
     ) -> IntentOutput:
         instructions = self._instructions(current, timezone)
+        selected_history = self._select_history(message, history)
         response = self.client.responses.parse(
             model=self.model,
             input=[
                 {"role": "system", "content": instructions},
-                *history,
+                {
+                    "role": "system",
+                    "content": (
+                        f"Now: {current.isoformat()}. User timezone: {timezone.key}."
+                    ),
+                },
+                *selected_history,
                 {"role": "user", "content": message},
             ],
             text_format=IntentOutput,
+            prompt_cache_key="remi-intent-v2",
         )
+        self._log_usage(response, len(selected_history))
         if response.output_parsed is None:
             raise IntentInterpretationError("The model did not return a usable intent")
         return response.output_parsed
@@ -158,11 +171,13 @@ class OpenAIIntentInterpreter:
                         f"Validation reason: {reason}"
                     ),
                 },
-                *history,
+                *history[-4:],
                 {"role": "user", "content": message},
             ],
             text_format=ClarificationOutput,
+            prompt_cache_key="remi-clarification-v1",
         )
+        self._log_usage(response, min(len(history), 4))
         if response.output_parsed is None:
             raise IntentInterpretationError("The model did not return a clarification")
         return response.output_parsed
@@ -170,108 +185,77 @@ class OpenAIIntentInterpreter:
     def _instructions(
         self, current: datetime, timezone: ZoneInfo | None = None
     ) -> str:
-        effective_timezone = timezone or self.timezone
         return (
-            "Classify the user's message for a reminder bot. Do not execute actions. "
-            "Interpret natural, casual English by meaning rather than requiring command "
-            "words. Use recent conversation turns to resolve follow-ups such as 'make "
-            "that 5pm', 'move it to tomorrow', or 'delete that one', but never invent "
-            "context that is absent. Use create to add a reminder; delete to permanently remove one named "
-            "reminder; delete_all to remove every active reminder belonging to the user; "
-            "complete to mark one named reminder completed; update to change the date or "
-            "time of one named reminder; list to show upcoming active "
-            "reminders; old to show reminders past their deadline; set_daily to enable, "
-            "change, or disable the daily summary; settings to show the current daily "
-            "summary time and whether it is enabled; set_timezone to change the user's "
-            "timezone; add_note to add or replace a note on a named reminder; "
-            "add_checklist_item to add a task to a named reminder; check_item to "
-            "complete one checklist item on a named reminder. "
-            "For set_timezone, return an IANA timezone in timezone_name, such as "
-            "Asia/Singapore, Europe/London, or America/New_York. 'I am in Tokyo' and "
-            "'change my timezone to Tokyo' mean set_timezone with Asia/Tokyo. "
-            "For create, extract optional supporting detail into note and bullet or "
-            "numbered task items into checklist_items. The main reminder title stays "
-            "short. 'Add a note to my trip reminder to bring my passport' means add_note, "
-            "title='trip', note='Bring my passport'. 'I packed the charger for my trip' "
-            "means check_item, title='trip', checklist_item='charger'. 'Add sunscreen "
-            "to my trip checklist' means add_checklist_item, title='trip', and "
-            "checklist_item='sunscreen'. "
-            "Repeating reminders are create actions with recurrence_frequency set to "
-            "daily, weekly, monthly, or yearly and recurrence_interval set to the number "
-            "of those units between occurrences. due_at is the first occurrence. Resolve "
-            "recurrence_end_at to ISO 8601 when the user supplies an ending condition such "
-            "as 'for the next 3 years'; otherwise it is null. A normal one-time reminder "
-            "uses recurrence_frequency='none', recurrence_interval=1, and a null end. "
-            "Every action other than create must also use recurrence_frequency='none', "
-            "recurrence_interval=1, and a null recurrence_end_at. "
-            "CRITICAL DISTINCTION: set_daily only changes the user's summary of their full "
-            "reminder list and requires words such as summary, digest, list, or 'my daily "
-            "reminder time'. Wording such as 'remind me every day', 'every week', 'weekly', "
-            "or 'each month' creates one repeating reminder and must never use set_daily. "
-            "Example: 'remind me to text Lee Hongliang at 12pm every day for the next 3 "
-            "years' means create, title='Text Lee Hongliang', due_at is the next 12:00, "
-            "recurrence_frequency='daily', recurrence_interval=1, and recurrence_end_at "
-            "is three years from now. 'Remind me at 12pm at least once every week to update "
-            "him about my lunch for the next 3 years' is a weekly repeating create action, "
-            "not a daily-summary setting. "
-            "Use chat for greetings, thanks, farewells, introductions, simple small talk, "
-            "or questions about what this reminder assistant can do. You are Remi, a "
-            "warm, calm, lightly playful personal reminder assistant. For chat, write a "
-            "natural reply of at most three short sentences in reply. Stay focused on "
-            "reminders and scheduling; if asked for unrelated knowledge or unsupported "
-            "actions, respond briefly and steer back to what you can do. Never claim an "
-            "action happened when action is chat. For every non-chat action except unknown, reply must "
-            "be an empty string because the application will acknowledge it after it is "
-            "safely completed. Examples: 'hi', 'hello', 'hey there', 'good morning', 'thanks', "
-            "'how are you?', and 'what can you do?' mean chat. "
-            "Questions such as 'when is my daily reminder?', 'what time is my daily "
-            "summary?', 'are daily reminders on?', and 'what timezone am I using?' mean "
-            "settings. Use unknown when a "
-            "supported request is missing or has conflicting details. For unknown, put "
-            "one short and focused clarification question in reply. "
-            "A request to tell, show, read, list, or describe the user's reminders means "
-            "list even when it is phrased as a short question or does not contain the word "
-            "list. Exact examples 'tell me my reminders', 'show me my reminders', 'what "
-            "are my reminders?', 'what is in my reminders?', 'list my reminders', 'what do "
-            "I have coming up?', 'show my schedule', 'anything on my reminder list?', and "
-            "'what have I got planned?' all mean list with high confidence. These are not "
-            "chat, settings, or unknown. 'Show my old reminders', 'what did I miss?', and "
-            "'what reminders have passed?' mean old. "
-            "Only use delete_all when the user explicitly applies a comprehensive word "
-            "such as all, every, clear, empty, or wipe to their reminders. Examples: "
-            "'delete all my reminders', 'clear my reminders', 'empty my reminder list', "
-            "and 'wipe every upcoming reminder' mean delete_all. For delete_all, title "
-            "must be empty. A request to remove a named topic means delete, not delete_all. "
-            "For update, title is only the existing reminder's identifying subject, due_at "
-            "is the new deadline, and trigger_phrase is the user's exact new date/time "
-            "phrase. 'Change the deadline for IDP assignment to 24 Aug' means update, "
-            "title='IDP assignment', trigger_phrase='24 Aug', and due_at is 24 Aug at "
-            "23:59. 'Move my dentist reminder to next Monday at 2pm' also means update. "
-            "For create, separately extract (1) the delivery "
-            "trigger into trigger_phrase and due_at and (2) the complete reminder subject "
-            "into title. Resolve due_at to ISO 8601. A date without a time defaults to "
-            "23:59. A time without a date means its next occurrence. "
-            "A scheduling expression attached to 'remind me', such as 'tomorrow', "
-            "'in 50 minutes', or 'at 4pm', controls delivery. A date that describes the "
-            "thing being remembered must remain in the title, especially a date after "
-            "'for', 'about', 'that', or the task object. Never silently drop meaningful "
-            "subject details from the title. If two delivery times are genuinely plausible, "
-            "use unknown with low confidence instead of guessing. Examples: "
-            "'send me a reminder tomorrow to book Chiikawa tickets for 22 Aug' means "
-            "trigger_phrase='tomorrow', due_at is tomorrow at 23:59, and title is "
-            "'Book Chiikawa tickets for 22 Aug'. "
-            "'remind me on 22 Aug to book Chiikawa tickets' means trigger_phrase='on 22 "
-            "Aug', due_at is 22 Aug at 23:59, and title is 'Book Chiikawa tickets'. "
-            "'remind me tomorrow at 4pm that the concert is on Friday' means the trigger "
-            "is tomorrow at 4pm and the title keeps 'The concert is on Friday'. "
-            "For delete/complete, title is the search "
-            "phrase. For set_daily, return daily_enabled and return daily_time as HH:MM "
-            "when enabling. Before returning, re-check that the selected action captures "
-            "the user's whole request and that no reminder details were lost. Reply is "
-            "always a string. Use null for nullable fields irrelevant to the action, "
-            "including trigger_phrase for actions other than create or update. Do not invent "
-            "missing dates, titles, or intentions. "
-            f"Current datetime: {current.isoformat()}. Timezone: {effective_timezone.key}."
+            "You classify natural messages for Remi; never execute actions. Actions: "
+            "create=new reminder; update=change named reminder deadline; delete=remove "
+            "one; delete_all=clear every active reminder; complete=finish one; list=active "
+            "list; old=past list; set_daily=enable/change/disable the full-list daily "
+            "summary; settings=show summary/timezone settings; set_timezone=change user "
+            "timezone; add_note; add_checklist_item; check_item; chat; unknown. Resolve "
+            "follow-ups from supplied history (for example 'make that 5pm') but never "
+            "invent missing context.\n"
+            "DATES: Resolve due_at as ISO 8601 in the supplied timezone. Date-only => "
+            "23:59; time-only => next occurrence. For create/update, trigger_phrase is the "
+            "exact scheduling phrase. Keep dates describing the subject in title. Never "
+            "silently drop meaningful subject details. Example: 'send me a reminder "
+            "tomorrow to book Chiikawa tickets for 22 Aug' => create, "
+            "trigger_phrase='tomorrow', title='Book Chiikawa tickets for 22 Aug'. 'remind "
+            "me on 22 Aug to book tickets' uses 22 Aug as delivery. For update, title is "
+            "only the existing subject: 'change IDP assignment to 24 Aug' => update, "
+            "title='IDP assignment', trigger_phrase='24 Aug'. If timing is genuinely "
+            "ambiguous, use unknown rather than guessing.\n"
+            "RECURRENCE: 'remind me every day/week/month/year' is create and must never "
+            "use set_daily. Set recurrence_frequency, interval, first due_at, and optional "
+            "recurrence_end_at. Other actions use frequency=none, interval=1, null end. "
+            "set_daily applies only to the user's summary/digest/list delivery time.\n"
+            "FIELDS: create may extract note and bullet/numbered checklist_items. add_note, "
+            "add_checklist_item and check_item require a named reminder and their matching "
+            "field. set_timezone returns an IANA name. set_daily returns daily_enabled and "
+            "HH:MM when enabled. delete/complete use title as the search phrase. delete_all "
+            "requires explicit all/every/clear/empty/wipe and an empty title.\n"
+            "LANGUAGE: tell/show/read/list/describe my reminders, including 'tell me my "
+            "reminders', 'show me my reminders', 'what are my reminders?', and 'what is "
+            "in my reminders?' => list. 'what did I miss?' => old. 'when is my daily "
+            "reminder?' or timezone/status questions => settings. Greetings, thanks and "
+            "capability questions => chat. For chat, reply as warm, calm, lightly playful "
+            "Remi in at most 3 short sentences, focused on reminders. unknown asks exactly "
+            "one focused clarification question. All other actions have empty reply. Use "
+            "null for irrelevant nullable fields and do a final completeness check."
+        )
+
+    @staticmethod
+    def _select_history(
+        message: str, history: list[dict[str, str]], limit: int = 4
+    ) -> list[dict[str, str]]:
+        """Only pay for history when the latest message appears context-dependent."""
+        normalized = message.lower().strip()
+        referential = re.search(
+            r"\b(it|that|this|those|them|one|ones|previous|earlier|instead|actually)\b",
+            normalized,
+        )
+        follow_up = re.match(
+            r"^(make|move|change|reschedule|delete|remove|complete|mark|add|yes|no)\b",
+            normalized,
+        )
+        fragment = len(normalized.split()) <= 5 and bool(
+            re.search(r"\b(today|tomorrow|tonight|next|at|am|pm|morning|evening)\b|\d", normalized)
+        )
+        if not (referential or follow_up or fragment):
+            return []
+        return history[-limit:]
+
+    @staticmethod
+    def _log_usage(response: object, history_turns: int) -> None:
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return
+        details = getattr(usage, "input_tokens_details", None)
+        LOGGER.info(
+            "OpenAI usage input=%s cached=%s output=%s history_turns=%s",
+            getattr(usage, "input_tokens", None),
+            getattr(details, "cached_tokens", 0) if details else 0,
+            getattr(usage, "output_tokens", None),
+            history_turns,
         )
 
     def _to_intent(

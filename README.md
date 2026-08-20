@@ -12,6 +12,9 @@ one-time or repeating reminders. `/start` is the only exposed command.
   hours and pending deletion confirmations for 10 minutes.
 - **Cloud Scheduler** calls `/jobs/process` once per minute to deliver due work.
 - **OpenAI Responses API** converts natural language into validated actions.
+- OpenAI requests use a stable cached instruction prefix and include recent chat
+  history only for contextual follow-ups. Cloud logs record input, cached input,
+  output, and attached-history token diagnostics for each model request.
 - **Secret Manager** supplies the Telegram token, OpenAI key, and webhook secret.
 
 The application has no polling mode and does not use local JSON storage.

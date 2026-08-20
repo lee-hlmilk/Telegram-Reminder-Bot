@@ -203,8 +203,27 @@ class ReminderCoreTests(unittest.TestCase):
         )
         prompt = interpreter._instructions(datetime(2026, 8, 19, 20, 27, tzinfo=SGT))
         self.assertIn("must never use set_daily", prompt)
-        self.assertIn("Text Lee Hongliang", prompt)
-        self.assertIn("weekly repeating create action", prompt)
+        self.assertIn("remind me every day/week/month/year", prompt)
+        self.assertIn("summary/digest/list", prompt)
+
+    def test_history_is_omitted_for_standalone_requests(self) -> None:
+        history = [
+            {"role": "user", "content": "Remind me about homework"},
+            {"role": "assistant", "content": "What time?"},
+        ]
+        self.assertEqual(
+            OpenAIIntentInterpreter._select_history("Show me my reminders", history),
+            [],
+        )
+
+    def test_contextual_follow_up_uses_only_four_recent_turns(self) -> None:
+        history = [
+            {"role": "user", "content": f"message {index}"} for index in range(7)
+        ]
+        selected = OpenAIIntentInterpreter._select_history(
+            "Actually make that tomorrow at 5pm", history
+        )
+        self.assertEqual(selected, history[-4:])
 
     def test_chat_intent_has_a_personality_reply(self) -> None:
         interpreter = OpenAIIntentInterpreter(
