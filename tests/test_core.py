@@ -1,12 +1,18 @@
 import unittest
-from datetime import datetime
+from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
-from bot import confirmation_decision
+from bot import (
+    _complete_draft,
+    _draft_from_intent,
+    _parse_date_answer,
+    _parse_time_answer,
+    confirmation_decision,
+)
 from reminder_bot.models import UserSettings
 from reminder_bot.models import Reminder
-from reminder_bot.llm import IntentInterpretationError, IntentOutput, OpenAIIntentInterpreter
-from reminder_bot.conversation import find_matching_reminders
+from reminder_bot.llm import IntentOutput, OpenAIIntentInterpreter
+from reminder_bot.conversation import ConversationIntent, find_matching_reminders
 from reminder_bot.service import (
     ReminderInputError,
     ReminderService,
@@ -81,7 +87,6 @@ class ReminderCoreTests(unittest.TestCase):
                 recurrence_frequency="none",
                 recurrence_interval=1,
                 recurrence_end_at=None,
-                confidence=0.95,
             ),
             datetime(2026, 8, 20, 12, 0, tzinfo=tokyo),
             tokyo,
@@ -104,33 +109,62 @@ class ReminderCoreTests(unittest.TestCase):
                 recurrence_frequency="none",
                 recurrence_interval=1,
                 recurrence_end_at=None,
-                confidence=0.9,
             )
         )
         self.assertEqual(intent.action, "create")
         self.assertEqual(intent.title, "Call Mum")
         self.assertEqual(intent.due_at.isoformat(), "2026-08-20T16:00:00+08:00")
 
-    def test_low_confidence_llm_output_is_rejected(self) -> None:
+    def test_vague_create_becomes_a_pending_time_question(self) -> None:
         interpreter = OpenAIIntentInterpreter(
             api_key="test-key", model="test", timezone=SGT
         )
-        with self.assertRaises(IntentInterpretationError):
-            interpreter._to_intent(
-                IntentOutput(
-                    action="delete",
-                    title="homework",
-                    due_at=None,
-                    trigger_phrase=None,
-                    daily_time=None,
-                    daily_enabled=None,
-                    reply="",
-                    recurrence_frequency="none",
-                    recurrence_interval=1,
-                    recurrence_end_at=None,
-                    confidence=0.2,
-                )
+        intent = interpreter._to_intent(
+            IntentOutput(
+                action="create",
+                title="Make Kahoot",
+                due_at="2026-08-21T23:59:00+08:00",
+                trigger_phrase="later today",
+                daily_time=None,
+                daily_enabled=None,
+                reply="",
+                recurrence_frequency="none",
+                recurrence_interval=1,
+                recurrence_end_at=None,
             )
+        )
+        self.assertEqual(intent.action, "unknown")
+        self.assertEqual(intent.reply, "What time should I remind you?")
+        self.assertEqual(intent.title, "Make Kahoot")
+
+    def test_pending_time_draft_completes_without_an_llm(self) -> None:
+        partial = ConversationIntent(
+            action="unknown",
+            title="Make Kahoot",
+            due_at=datetime(2026, 8, 21, 23, 59, tzinfo=SGT),
+            trigger_phrase="later today",
+            reply="What time should I remind you?",
+        )
+        draft = _draft_from_intent(partial)
+        completed = _complete_draft(draft, "set it for 1900", SGT)
+        self.assertEqual(completed.action, "create")
+        self.assertEqual(completed.title, "Make Kahoot")
+        self.assertEqual(completed.due_at.isoformat(), "2026-08-21T19:00:00+08:00")
+        self.assertEqual(_parse_time_answer("7:30pm"), time(19, 30))
+
+    def test_pending_date_draft_completes_without_an_llm(self) -> None:
+        partial = ConversationIntent(
+            action="unknown",
+            title="Make Kahoot",
+            trigger_phrase="at 7pm",
+            reply="What date should I use?",
+        )
+        draft = _draft_from_intent(partial)
+        completed = _complete_draft(draft, "21 Aug 2026", SGT)
+        self.assertEqual(completed.due_at.isoformat(), "2026-08-21T19:00:00+08:00")
+        self.assertEqual(
+            _parse_date_answer("21 Aug 2026", SGT).date().isoformat(), "2026-08-21"
+        )
 
     def test_prompt_separates_delivery_date_from_subject_date(self) -> None:
         interpreter = OpenAIIntentInterpreter(
@@ -171,12 +205,11 @@ class ReminderCoreTests(unittest.TestCase):
                 recurrence_frequency="none",
                 recurrence_interval=1,
                 recurrence_end_at=None,
-                confidence=0.2,
             )
         )
         self.assertEqual(intent.reply, "What time should I remind you?")
 
-    def test_read_only_list_intent_accepts_moderate_confidence(self) -> None:
+    def test_read_only_list_intent_is_accepted(self) -> None:
         interpreter = OpenAIIntentInterpreter(
             api_key="test-key", model="test", timezone=SGT
         )
@@ -192,7 +225,6 @@ class ReminderCoreTests(unittest.TestCase):
                 recurrence_frequency="none",
                 recurrence_interval=1,
                 recurrence_end_at=None,
-                confidence=0.5,
             )
         )
         self.assertEqual(intent.action, "list")
@@ -282,13 +314,12 @@ class ReminderCoreTests(unittest.TestCase):
                 recurrence_frequency="none",
                 recurrence_interval=1,
                 recurrence_end_at=None,
-                confidence=0.95,
             )
         )
         self.assertEqual(intent.action, "chat")
         self.assertEqual(intent.reply, "Hey! What can I help you remember?")
 
-    def test_safe_small_talk_can_use_a_lower_confidence_threshold(self) -> None:
+    def test_safe_small_talk_is_accepted(self) -> None:
         interpreter = OpenAIIntentInterpreter(
             api_key="test-key", model="test", timezone=SGT
         )
@@ -304,7 +335,6 @@ class ReminderCoreTests(unittest.TestCase):
                 recurrence_frequency="none",
                 recurrence_interval=1,
                 recurrence_end_at=None,
-                confidence=0.5,
             )
         )
         self.assertEqual(intent.action, "chat")
@@ -325,7 +355,6 @@ class ReminderCoreTests(unittest.TestCase):
                 recurrence_frequency="none",
                 recurrence_interval=1,
                 recurrence_end_at=None,
-                confidence=0.95,
             ),
             datetime(2026, 8, 19, 20, 22, tzinfo=SGT),
         )
@@ -347,7 +376,6 @@ class ReminderCoreTests(unittest.TestCase):
                 recurrence_frequency="none",
                 recurrence_interval=1,
                 recurrence_end_at=None,
-                confidence=0.95,
             ),
             datetime(2026, 8, 19, 20, 23, tzinfo=SGT),
         )
@@ -371,7 +399,6 @@ class ReminderCoreTests(unittest.TestCase):
                 recurrence_frequency="daily",
                 recurrence_interval=1,
                 recurrence_end_at="2029-08-19T23:59:00+08:00",
-                confidence=0.98,
             ),
             datetime(2026, 8, 19, 20, 27, tzinfo=SGT),
         )

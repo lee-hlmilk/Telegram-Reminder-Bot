@@ -18,6 +18,9 @@ one-time or repeating reminders. `/start` is the only exposed command.
 - Exact, context-free list, old-list, settings, bulk-clear, and basic greeting
   messages use a zero-token local fast path; all scheduling and ambiguous language
   continues through OpenAI.
+- Incomplete reminder creations are kept as 30-minute Firestore drafts. Common
+  time answers complete those drafts locally, and validation questions never make
+  a second OpenAI request. Reminder creation is not confirmation-gated.
 - **Secret Manager** supplies the Telegram token, OpenAI key, and webhook secret.
 
 The application has no polling mode and does not use local JSON storage.

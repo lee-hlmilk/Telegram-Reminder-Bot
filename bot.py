@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -10,7 +10,7 @@ from telegram import BotCommand, Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.helpers import escape_markdown
 
-from reminder_bot.conversation import find_matching_reminders
+from reminder_bot.conversation import ConversationIntent, find_matching_reminders
 from reminder_bot.llm import (
     IntentInterpretationError,
     LLMUnavailableError,
@@ -59,6 +59,160 @@ def confirmation_decision(message: str) -> bool | None:
     ):
         return True
     return None
+
+
+def _parse_time_answer(message: str) -> time | None:
+    normalized = message.lower().strip()
+    am_pm = re.search(
+        r"\b(1[0-2]|0?[1-9])(?::([0-5]\d))?\s*(am|pm)\b", normalized
+    )
+    if am_pm:
+        hour = int(am_pm.group(1)) % 12
+        if am_pm.group(3) == "pm":
+            hour += 12
+        return time(hour, int(am_pm.group(2) or 0))
+    colon = re.search(r"\b([01]?\d|2[0-3])[:.]([0-5]\d)\b", normalized)
+    if colon:
+        return time(int(colon.group(1)), int(colon.group(2)))
+    compact = re.search(r"\b(\d|[01]\d|2[0-3])([0-5]\d)\b", normalized)
+    if compact:
+        return time(int(compact.group(1)), int(compact.group(2)))
+    return None
+
+
+_MONTHS = {
+    name: index
+    for index, names in enumerate(
+        (
+            (),
+            ("jan", "january"),
+            ("feb", "february"),
+            ("mar", "march"),
+            ("apr", "april"),
+            ("may",),
+            ("jun", "june"),
+            ("jul", "july"),
+            ("aug", "august"),
+            ("sep", "sept", "september"),
+            ("oct", "october"),
+            ("nov", "november"),
+            ("dec", "december"),
+        )
+    )
+    for name in names
+}
+
+
+def _parse_date_answer(message: str, timezone: ZoneInfo) -> datetime | None:
+    normalized = " ".join(re.findall(r"[a-z0-9]+", message.lower()))
+    now = datetime.now(timezone)
+    if normalized in {"today", "later today"}:
+        return now.replace(hour=23, minute=59, second=0, microsecond=0)
+    if normalized == "tomorrow":
+        tomorrow = now + timedelta(days=1)
+        return tomorrow.replace(hour=23, minute=59, second=0, microsecond=0)
+    match = re.fullmatch(
+        r"(?:(\d{1,2}) ([a-z]+)|([a-z]+) (\d{1,2}))(?: (\d{4}))?",
+        normalized,
+    )
+    if match is None:
+        return None
+    day = int(match.group(1) or match.group(4))
+    month = _MONTHS.get(match.group(2) or match.group(3))
+    if month is None:
+        return None
+    year = int(match.group(5) or now.year)
+    try:
+        candidate = datetime(year, month, day, 23, 59, tzinfo=timezone)
+    except ValueError:
+        return None
+    if match.group(5) is None and candidate < now:
+        candidate = candidate.replace(year=year + 1)
+    return candidate
+
+
+def _draft_from_intent(intent: ConversationIntent) -> dict[str, Any] | None:
+    if not intent.title:
+        return None
+    missing = "time" if intent.due_at is not None else "date"
+    return {
+        "action": "create",
+        "title": intent.title,
+        "due_at": intent.due_at.isoformat() if intent.due_at is not None else None,
+        "trigger_phrase": intent.trigger_phrase,
+        "missing": missing,
+        "recurrence_frequency": intent.recurrence_frequency,
+        "recurrence_interval": intent.recurrence_interval,
+        "recurrence_end_at": (
+            intent.recurrence_end_at.isoformat()
+            if intent.recurrence_end_at is not None
+            else None
+        ),
+        "note": intent.note,
+        "checklist_items": list(intent.checklist_items),
+    }
+
+
+def _complete_draft(
+    draft: dict[str, Any], message: str, timezone: ZoneInfo
+) -> ConversationIntent | None:
+    if draft.get("action") != "create":
+        return None
+    missing = draft.get("missing")
+    if missing == "time":
+        parsed_time = _parse_time_answer(message)
+        if parsed_time is None:
+            return None
+        try:
+            base_due = datetime.fromisoformat(str(draft["due_at"]))
+        except (KeyError, TypeError, ValueError):
+            return None
+        if base_due.tzinfo is None:
+            base_due = base_due.replace(tzinfo=timezone)
+        local_due = base_due.astimezone(timezone).replace(
+            hour=parsed_time.hour, minute=parsed_time.minute, second=0, microsecond=0
+        )
+    elif missing == "date":
+        base_due = _parse_date_answer(message, timezone)
+        if base_due is None:
+            return None
+        saved_time = _parse_time_answer(str(draft.get("trigger_phrase") or ""))
+        local_due = base_due.replace(
+            hour=saved_time.hour if saved_time else 23,
+            minute=saved_time.minute if saved_time else 59,
+        )
+    else:
+        return None
+    recurrence_end = None
+    if draft.get("recurrence_end_at"):
+        try:
+            recurrence_end = datetime.fromisoformat(str(draft["recurrence_end_at"]))
+        except ValueError:
+            recurrence_end = None
+    return ConversationIntent(
+        action="create",
+        title=str(draft.get("title", "")).strip(),
+        due_at=local_due,
+        trigger_phrase=str(draft.get("trigger_phrase") or "time clarification"),
+        recurrence_frequency=str(draft.get("recurrence_frequency", "none")),
+        recurrence_interval=int(draft.get("recurrence_interval", 1)),
+        recurrence_end_at=recurrence_end,
+        note=str(draft.get("note", "")),
+        checklist_items=tuple(str(item) for item in draft.get("checklist_items", [])),
+    )
+
+
+def _local_clarification(reason: str) -> str:
+    lowered = reason.lower()
+    if "title" in lowered or "description" in lowered:
+        return "What should I remind you about?"
+    if "time" in lowered or "deadline" in lowered or "date" in lowered:
+        return "What date and time should I use?"
+    if "timezone" in lowered:
+        return "Which city or timezone should I use?"
+    if "checklist" in lowered:
+        return "Which checklist item do you mean?"
+    return "What reminder detail should I clarify?"
 
 
 def _append_reminder_details(lines: list[str], reminder: Any) -> None:
@@ -238,6 +392,7 @@ def build_application(
         user_timezone = get_timezone(user_setting.timezone)
         history = conversation_store.history(user_id)
         pending = conversation_store.confirmation(user_id)
+        draft = conversation_store.draft(user_id)
         conversation_store.append(user_id, "user", message)
 
         async def respond(text: str, **kwargs: Any) -> None:
@@ -269,25 +424,32 @@ def build_application(
                     return
             # A new request implicitly abandons the old confirmation.
             conversation_store.clear_confirmation(user_id)
-        try:
-            intent = await llm_interpreter.interpret(
-                message, history=history, timezone=user_timezone
-            )
-        except LLMUnavailableError:
-            LOGGER.exception("OpenAI intent interpretation failed")
-            await respond(
-                "I can’t reach the language service right now. Please try again shortly."
-            )
-            return
-        except IntentInterpretationError as exc:
+
+        intent = None
+        if draft is not None:
+            if confirmation_decision(message) is False:
+                conversation_store.clear_draft(user_id)
+                await respond("Okay, I cancelled that unfinished reminder.")
+                return
+            intent = _complete_draft(draft, message, user_timezone)
+            if intent is not None:
+                conversation_store.clear_draft(user_id)
+                LOGGER.info("Reminder draft completed locally input_tokens=0")
+
+        if intent is None:
             try:
-                question = await llm_interpreter.clarification(
-                    message, history, str(exc)
+                intent = await llm_interpreter.interpret(
+                    message, history=history, timezone=user_timezone
                 )
-            except (IntentInterpretationError, LLMUnavailableError):
-                question = "What reminder, date, or time would you like me to clarify?"
-            await respond(question)
-            return
+            except LLMUnavailableError:
+                LOGGER.exception("OpenAI intent interpretation failed")
+                await respond(
+                    "I can’t reach the language service right now. Please try again shortly."
+                )
+                return
+            except IntentInterpretationError as exc:
+                await respond(_local_clarification(str(exc)))
+                return
 
         if intent.action == "create" and intent.due_at:
             try:
@@ -305,6 +467,7 @@ def build_application(
             except ReminderInputError as exc:
                 await respond(f"⚠️ {exc}")
                 return
+            conversation_store.clear_draft(user_id)
             due = reminder.due_datetime.astimezone(user_timezone)
             await respond(
                 "✅ Reminder created!\n\n"
@@ -543,6 +706,9 @@ def build_application(
             return
 
         if intent.action == "unknown":
+            pending_draft = _draft_from_intent(intent)
+            if pending_draft is not None:
+                conversation_store.set_draft(user_id, pending_draft)
             await respond(intent.reply)
             return
 

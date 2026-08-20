@@ -8,7 +8,7 @@ from google.cloud.firestore_v1.base_query import FieldFilter
 
 
 class FirestoreConversationStore:
-    """Short-lived chat context and destructive-action confirmations."""
+    """Short-lived chat context, reminder drafts, and confirmations."""
 
     def __init__(
         self,
@@ -108,6 +108,40 @@ class FirestoreConversationStore:
             {
                 "pending_confirmation": firestore.DELETE_FIELD,
                 "confirmation_expires_at": firestore.DELETE_FIELD,
+            },
+            merge=True,
+        )
+
+    def set_draft(self, user_id: int, draft: dict[str, Any]) -> None:
+        self.collection.document(str(user_id)).set(
+            {
+                "pending_draft": draft,
+                "draft_expires_at": datetime.now(timezone.utc) + timedelta(minutes=30),
+                "updated_at": firestore.SERVER_TIMESTAMP,
+                "expires_at": datetime.now(timezone.utc) + timedelta(hours=24),
+            },
+            merge=True,
+        )
+
+    def draft(self, user_id: int) -> dict[str, Any] | None:
+        snapshot = self.collection.document(str(user_id)).get()
+        if not snapshot.exists:
+            return None
+        value = snapshot.to_dict() or {}
+        draft = value.get("pending_draft")
+        expires_at = value.get("draft_expires_at")
+        if not isinstance(draft, dict):
+            return None
+        if not isinstance(expires_at, datetime) or expires_at <= datetime.now(timezone.utc):
+            self.clear_draft(user_id)
+            return None
+        return draft
+
+    def clear_draft(self, user_id: int) -> None:
+        self.collection.document(str(user_id)).set(
+            {
+                "pending_draft": firestore.DELETE_FIELD,
+                "draft_expires_at": firestore.DELETE_FIELD,
             },
             merge=True,
         )

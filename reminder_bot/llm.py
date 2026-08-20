@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import math
 import re
 from datetime import datetime, timedelta
 from typing import Literal
@@ -46,17 +45,10 @@ class IntentOutput(BaseModel):
     recurrence_frequency: Literal["none", "daily", "weekly", "monthly", "yearly"]
     recurrence_interval: int = Field(ge=1, le=365)
     recurrence_end_at: str | None
-    confidence: float = Field(ge=0, le=1)
     note: str | None = None
     checklist_items: list[str] = Field(default_factory=list)
     checklist_item: str | None = None
     timezone_name: str | None = None
-
-
-class ClarificationOutput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    question: str
 
 
 class IntentInterpretationError(RuntimeError):
@@ -77,11 +69,9 @@ class OpenAIIntentInterpreter:
         model: str,
         timezone: ZoneInfo,
         timeout_seconds: float = 20,
-        minimum_confidence: float = 0.65,
     ) -> None:
         self.model = model
         self.timezone = timezone
-        self.minimum_confidence = minimum_confidence
         self.client = OpenAI(
             api_key=api_key,
             timeout=timeout_seconds,
@@ -204,53 +194,6 @@ class OpenAIIntentInterpreter:
             raise IntentInterpretationError("The model did not return a usable intent")
         return response.output_parsed
 
-    async def clarification(
-        self,
-        message: str,
-        history: list[dict[str, str]],
-        reason: str,
-    ) -> str:
-        try:
-            output = await asyncio.to_thread(
-                self._clarification_request, message, history, reason
-            )
-        except OpenAIError as exc:
-            raise LLMUnavailableError("OpenAI clarification request failed") from exc
-        question = output.question.strip()
-        if not question:
-            raise IntentInterpretationError("The clarification was empty")
-        return question
-
-    def _clarification_request(
-        self,
-        message: str,
-        history: list[dict[str, str]],
-        reason: str,
-    ) -> ClarificationOutput:
-        response = self.client.responses.parse(
-            model=self.model,
-            input=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are Remi, a reminder assistant. The latest request could "
-                        "not be executed safely. Ask exactly one short, specific question "
-                        "that obtains only the missing or ambiguous reminder detail. "
-                        "Use recent conversation context. Do not claim an action occurred. "
-                        f"Validation reason: {reason}"
-                    ),
-                },
-                *history[-8:],
-                {"role": "user", "content": message},
-            ],
-            text_format=ClarificationOutput,
-            prompt_cache_key="remi-clarification-v1",
-        )
-        self._log_usage(response, min(len(history), 8))
-        if response.output_parsed is None:
-            raise IntentInterpretationError("The model did not return a clarification")
-        return response.output_parsed
-
     def _instructions(
         self, current: datetime, timezone: ZoneInfo | None = None
     ) -> str:
@@ -281,7 +224,8 @@ class OpenAIIntentInterpreter:
             "add_checklist_item and check_item require a named reminder and their matching "
             "field. set_timezone returns an IANA name. set_daily returns daily_enabled and "
             "HH:MM when enabled. delete/complete use title as the search phrase. delete_all "
-            "requires explicit all/every/clear/empty/wipe and an empty title.\n"
+            "requires explicit all/every/clear/empty/wipe and an empty title; 'clear my "
+            "reminders' => delete_all.\n"
             "LANGUAGE: tell/show/read/list/describe my reminders, including 'tell me my "
             "reminders', 'show me my reminders', 'what are my reminders?', and 'what is "
             "in my reminders?' => list with empty title. Topic-filtered requests such as "
@@ -292,7 +236,11 @@ class OpenAIIntentInterpreter:
             "reminder?' or timezone/status questions => settings. Greetings, thanks and "
             "capability questions => chat. For chat, reply as warm, calm, lightly playful "
             "Remi in at most 3 short sentences, focused on reminders. unknown asks exactly "
-            "one focused clarification question. All other actions have empty reply. Use "
+            "one focused question for a genuinely missing factual detail; never ask the "
+            "user to confirm creating or updating a reminder. Follow-up answers complete "
+            "the earlier request: if the user asked for a reminder later today and then "
+            "says 'set it for 1900', return create for today at 19:00 immediately. All "
+            "other actions have empty reply. Use "
             "null for irrelevant nullable fields and do a final completeness check."
         )
 
@@ -338,15 +286,6 @@ class OpenAIIntentInterpreter:
         timezone: ZoneInfo | None = None,
     ) -> ConversationIntent:
         effective_timezone = timezone or self.timezone
-        # Read-only requests are safe to honor at a lower confidence than mutations.
-        minimum_confidence = (
-            0.4
-            if value.action in {"chat", "list", "old", "settings", "unknown"}
-            else self.minimum_confidence
-        )
-        if not math.isfinite(value.confidence) or value.confidence < minimum_confidence:
-            raise IntentInterpretationError("The request was too ambiguous")
-
         title = value.title.strip()
         trigger_phrase = (
             value.trigger_phrase.strip() if value.trigger_phrase is not None else None
@@ -379,6 +318,43 @@ class OpenAIIntentInterpreter:
                 current or datetime.now(effective_timezone),
                 due_at,
                 effective_timezone,
+            )
+
+        if value.action == "create" and title and due_at is None:
+            return ConversationIntent(
+                action="unknown",
+                title=title,
+                trigger_phrase=trigger_phrase,
+                reply="What date should I use?",
+                recurrence_frequency=value.recurrence_frequency,
+                recurrence_interval=value.recurrence_interval,
+                recurrence_end_at=recurrence_end_at,
+                note=(value.note or "").strip(),
+                checklist_items=tuple(
+                    item.strip() for item in value.checklist_items if item.strip()
+                ),
+            )
+
+        if (
+            value.action == "create"
+            and title
+            and due_at is not None
+            and trigger_phrase
+            and _vague_time_phrase(trigger_phrase)
+        ):
+            return ConversationIntent(
+                action="unknown",
+                title=title,
+                due_at=due_at,
+                trigger_phrase=trigger_phrase,
+                reply="What time should I remind you?",
+                recurrence_frequency=value.recurrence_frequency,
+                recurrence_interval=value.recurrence_interval,
+                recurrence_end_at=recurrence_end_at,
+                note=(value.note or "").strip(),
+                checklist_items=tuple(
+                    item.strip() for item in value.checklist_items if item.strip()
+                ),
             )
 
         if value.action == "create" and (
@@ -453,6 +429,22 @@ _WEEKDAYS = {
     "saturday": 5,
     "sunday": 6,
 }
+
+
+def _vague_time_phrase(value: str) -> bool:
+    normalized = value.lower()
+    vague = bool(
+        re.search(r"\b(later today|tonight|this evening|this afternoon)\b", normalized)
+    )
+    explicit = bool(
+        re.search(
+            r"\b(?:[01]?\d|2[0-3])[:.]\d{2}\b|"
+            r"\b(?:1[0-2]|0?[1-9])(?::[0-5]\d)?\s*(?:am|pm)\b|"
+            r"\b(?:\d|[01]\d|2[0-3])[0-5]\d\b",
+            normalized,
+        )
+    )
+    return vague and not explicit
 
 
 def _correct_named_weekday(
