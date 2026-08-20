@@ -59,6 +59,7 @@ def _reminder_data(reminder: Reminder) -> dict[str, Any]:
         "recurrence_end_at": reminder.recurrence_end_datetime,
         "purge_at": _purge_at(reminder),
         "lease_until": None,
+        "advance_notice_for": None,
     }
 
 
@@ -200,6 +201,7 @@ class FirestoreReminderStore:
                     "status": "active",
                     "purge_at": _purge_at(updated),
                     "lease_until": None,
+                    "advance_notice_for": None,
                 },
             )
             return updated
@@ -268,6 +270,68 @@ class FirestoreReminderStore:
                 claimed.append(reminder)
         return claimed
 
+    def claim_upcoming(
+        self,
+        now: datetime,
+        *,
+        lead_minutes: int = 60,
+        limit: int = 100,
+    ) -> list[Reminder]:
+        """Claim reminders entering their advance-warning window exactly once."""
+        warning_cutoff = now + timedelta(minutes=lead_minutes)
+        candidates = list(
+            self.collection.where(filter=FieldFilter("status", "==", "active"))
+            .where(filter=FieldFilter("due_at", ">", now))
+            .where(filter=FieldFilter("due_at", "<=", warning_cutoff))
+            .limit(limit)
+            .stream()
+        )
+
+        claimed: list[Reminder] = []
+        for snapshot in candidates:
+            reference = snapshot.reference
+            transaction = self.client.transaction()
+
+            @firestore.transactional
+            def claim(transaction: Any) -> Reminder | None:
+                current = reference.get(transaction=transaction)
+                if not current.exists:
+                    return None
+                value = current.to_dict() or {}
+                due_at = _as_datetime(value.get("due_at"))
+                already_sent_for = _as_datetime(value.get("advance_notice_for"))
+                if (
+                    value.get("status") != "active"
+                    or due_at is None
+                    or due_at <= now
+                    or due_at > warning_cutoff
+                    or already_sent_for == due_at
+                ):
+                    return None
+                transaction.update(reference, {"advance_notice_for": due_at})
+                return _reminder_from_document(current)
+
+            reminder = claim(transaction)
+            if reminder is not None:
+                claimed.append(reminder)
+        return claimed
+
+    def release_upcoming_claim(self, reminder: Reminder) -> None:
+        """Allow a failed advance warning to be retried on the next worker run."""
+        reference = self.collection.document(reminder.id)
+        transaction = self.client.transaction()
+
+        @firestore.transactional
+        def release(transaction: Any) -> None:
+            current = reference.get(transaction=transaction)
+            if not current.exists:
+                return
+            sent_for = _as_datetime(current.get("advance_notice_for"))
+            if sent_for == reminder.due_datetime:
+                transaction.update(reference, {"advance_notice_for": None})
+
+        release(transaction)
+
     def finish_delivery(
         self, reminder: Reminder, next_due: datetime | None
     ) -> None:
@@ -293,6 +357,7 @@ class FirestoreReminderStore:
                 "status": "active",
                 "lease_until": None,
                 "purge_at": _purge_at(updated),
+                "advance_notice_for": None,
             }
         )
 

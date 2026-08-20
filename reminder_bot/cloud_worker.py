@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime
 from typing import Any
 
@@ -43,9 +44,32 @@ async def process_cloud_work(
     """Deliver due work once; Firestore claims protect overlapping invocations."""
     now = datetime.now(service.timezone)
     reminder_store = service.store
+    warning_minutes = int(os.getenv("REMINDER_WARNING_MINUTES", "60"))
+    if warning_minutes < 1 or warning_minutes > 10080:
+        raise RuntimeError("REMINDER_WARNING_MINUTES must be between 1 and 10080")
+
+    upcoming = reminder_store.claim_upcoming(now, lead_minutes=warning_minutes)
+    upcoming_sent = 0
+    failed = 0
+    for reminder in upcoming:
+        due = reminder.due_datetime.astimezone(service.timezone)
+        try:
+            await application.bot.send_message(
+                chat_id=reminder.chat_id,
+                text=(
+                    "⏳ Upcoming reminder\n\n"
+                    f"📌 {reminder.text}\n"
+                    f"⏰ Due at {due:%H:%M}"
+                ),
+            )
+            upcoming_sent += 1
+        except Exception:
+            failed += 1
+            LOGGER.exception("Could not deliver advance warning %s", reminder.id)
+            reminder_store.release_upcoming_claim(reminder)
+
     claimed = reminder_store.claim_due(now)
     sent = 0
-    failed = 0
     for reminder in claimed:
         try:
             await application.bot.send_message(
@@ -93,6 +117,7 @@ async def process_cloud_work(
 
     purged = reminder_store.purge_old(now)
     return {
+        "advance_warnings_sent": upcoming_sent,
         "reminders_sent": sent,
         "summaries_sent": summaries,
         "purged": purged,

@@ -30,6 +30,10 @@ Daily summaries are enabled for new users at `08:00` by default. Completed and
 expired reminders move to the old list and are purged seven days after their
 deadline.
 
+Each reminder sends an advance warning 60 minutes before its deadline and a
+second notification at the deadline. `REMINDER_WARNING_MINUTES` controls the
+warning window.
+
 ## Required environment variables
 
 ```text
@@ -42,6 +46,7 @@ CLOUD_RUN_AUDIENCE
 SCHEDULER_SERVICE_ACCOUNT
 BOT_TIMEZONE=Asia/Singapore
 DEFAULT_DAILY_TIME=08:00
+REMINDER_WARNING_MINUTES=60
 OPENAI_MODEL=gpt-4o-mini
 OPENAI_TIMEOUT_SECONDS=20
 ```
