@@ -95,6 +95,10 @@ class OpenAIIntentInterpreter:
         history: list[dict[str, str]] | None = None,
         timezone: ZoneInfo | None = None,
     ) -> ConversationIntent:
+        fast_intent = self._fast_intent(message)
+        if fast_intent is not None:
+            LOGGER.info("Intent fast path action=%s input_tokens=0", fast_intent.action)
+            return fast_intent
         effective_timezone = timezone or self.timezone
         current = now or datetime.now(effective_timezone)
         try:
@@ -104,6 +108,55 @@ class OpenAIIntentInterpreter:
         except OpenAIError as exc:
             raise LLMUnavailableError("OpenAI request failed") from exc
         return self._to_intent(output, current, effective_timezone)
+
+    @staticmethod
+    def _fast_intent(message: str) -> ConversationIntent | None:
+        """Resolve only exact, context-free requests without an OpenAI call."""
+        normalized = " ".join(re.findall(r"[a-z0-9]+", message.lower()))
+
+        patterns: tuple[tuple[str, str], ...] = (
+            (
+                "list",
+                r"(?:please )?(?:(?:show|tell|list)(?: me)?(?: all)?(?: of)? my "
+                r"(?:active |upcoming )?reminders|what (?:are|is in) my reminders|"
+                r"what do i have coming up|show me my schedule)(?: please)?",
+            ),
+            (
+                "old",
+                r"(?:please )?(?:show|tell|list)(?: me)? my (?:old|past|expired) "
+                r"reminders(?: please)?|what did i miss|what reminders have passed",
+            ),
+            (
+                "settings",
+                r"(?:please )?(?:show|tell) me my (?:reminder )?settings(?: please)?|"
+                r"what time is my daily (?:reminder|summary)|when is my daily reminder|"
+                r"are daily reminders on|what timezone am i using",
+            ),
+            (
+                "delete_all",
+                r"(?:please )?(?:delete|clear|remove|empty|wipe)(?: all| every)? "
+                r"(?:of )?my (?:active )?reminders(?: please)?",
+            ),
+        )
+        for action, pattern in patterns:
+            if re.fullmatch(pattern, normalized):
+                return ConversationIntent(action=action)
+
+        chat_replies = {
+            "hi": "Hi! What can I help you remember? 😊",
+            "hello": "Hello! What can I help you remember? 😊",
+            "hey": "Hey! What can I help you remember? 😊",
+            "good morning": "Good morning! What can I help you remember today? ☀️",
+            "good afternoon": "Good afternoon! What can I help you remember?",
+            "good evening": "Good evening! What can I help you remember?",
+            "thanks": "You’re welcome! 😊",
+            "thank you": "You’re welcome! 😊",
+            "how are you": "I’m doing well—and ready to keep you on schedule. 😊",
+        }
+        reply = chat_replies.get(normalized)
+        if reply is not None:
+            return ConversationIntent(action="chat", reply=reply)
+        return None
 
     def _request(
         self,

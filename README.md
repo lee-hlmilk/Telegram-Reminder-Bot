@@ -15,6 +15,9 @@ one-time or repeating reminders. `/start` is the only exposed command.
 - OpenAI requests use a stable cached instruction prefix and include recent chat
   history only for contextual follow-ups. Cloud logs record input, cached input,
   output, and attached-history token diagnostics for each model request.
+- Exact, context-free list, old-list, settings, bulk-clear, and basic greeting
+  messages use a zero-token local fast path; all scheduling and ambiguous language
+  continues through OpenAI.
 - **Secret Manager** supplies the Telegram token, OpenAI key, and webhook secret.
 
 The application has no polling mode and does not use local JSON storage.

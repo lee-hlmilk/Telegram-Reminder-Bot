@@ -225,6 +225,38 @@ class ReminderCoreTests(unittest.TestCase):
         )
         self.assertEqual(selected, history[-4:])
 
+    def test_fast_path_handles_common_read_only_requests(self) -> None:
+        interpreter = OpenAIIntentInterpreter(
+            api_key="test-key", model="test", timezone=SGT
+        )
+        self.assertEqual(interpreter._fast_intent("Show me my reminders").action, "list")
+        self.assertEqual(interpreter._fast_intent("What did I miss?").action, "old")
+        self.assertEqual(
+            interpreter._fast_intent("What timezone am I using?").action, "settings"
+        )
+
+    def test_fast_path_handles_greetings_and_confirmed_bulk_clear_intent(self) -> None:
+        interpreter = OpenAIIntentInterpreter(
+            api_key="test-key", model="test", timezone=SGT
+        )
+        greeting = interpreter._fast_intent("Hello!")
+        self.assertEqual(greeting.action, "chat")
+        self.assertTrue(greeting.reply)
+        self.assertEqual(
+            interpreter._fast_intent("Clear all my reminders").action, "delete_all"
+        )
+
+    def test_fast_path_defers_complex_requests_to_openai(self) -> None:
+        interpreter = OpenAIIntentInterpreter(
+            api_key="test-key", model="test", timezone=SGT
+        )
+        self.assertIsNone(
+            interpreter._fast_intent("Remind me tomorrow at 5pm to call Mum")
+        )
+        self.assertIsNone(
+            interpreter._fast_intent("Delete my science homework reminder")
+        )
+
     def test_chat_intent_has_a_personality_reply(self) -> None:
         interpreter = OpenAIIntentInterpreter(
             api_key="test-key", model="test", timezone=SGT
