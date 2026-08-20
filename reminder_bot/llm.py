@@ -114,6 +114,22 @@ class OpenAIIntentInterpreter:
         """Resolve only exact, context-free requests without an OpenAI call."""
         normalized = " ".join(re.findall(r"[a-z0-9]+", message.lower()))
 
+        named_delete = re.fullmatch(
+            r"(?:please )?(?:delete|remove) my (.+?) reminder(?: please)?",
+            normalized,
+        )
+        if named_delete is not None:
+            return ConversationIntent(action="delete", title=named_delete.group(1))
+
+        filtered_list = re.fullmatch(
+            r"(?:what (.+?) reminders are there|(?:show|tell|list)(?: me)? "
+            r"(?:all )?my (.+?) reminders)(?: please)?",
+            normalized,
+        )
+        if filtered_list is not None:
+            topic = filtered_list.group(1) or filtered_list.group(2)
+            return ConversationIntent(action="list", title=topic)
+
         patterns: tuple[tuple[str, str], ...] = (
             (
                 "list",
@@ -224,13 +240,13 @@ class OpenAIIntentInterpreter:
                         f"Validation reason: {reason}"
                     ),
                 },
-                *history[-4:],
+                *history[-8:],
                 {"role": "user", "content": message},
             ],
             text_format=ClarificationOutput,
             prompt_cache_key="remi-clarification-v1",
         )
-        self._log_usage(response, min(len(history), 4))
+        self._log_usage(response, min(len(history), 8))
         if response.output_parsed is None:
             raise IntentInterpretationError("The model did not return a clarification")
         return response.output_parsed
@@ -268,7 +284,11 @@ class OpenAIIntentInterpreter:
             "requires explicit all/every/clear/empty/wipe and an empty title.\n"
             "LANGUAGE: tell/show/read/list/describe my reminders, including 'tell me my "
             "reminders', 'show me my reminders', 'what are my reminders?', and 'what is "
-            "in my reminders?' => list. 'what did I miss?' => old. 'when is my daily "
+            "in my reminders?' => list with empty title. Topic-filtered requests such as "
+            "'what Kahoot reminders are there?' or 'show all my Kahoot reminders' => list "
+            "with title='Kahoot'. 'delete my Kahoot reminder' => delete with title='Kahoot'; "
+            "do not ask for a date or more detail merely because the title is broad. "
+            "'what did I miss?' => old. 'when is my daily "
             "reminder?' or timezone/status questions => settings. Greetings, thanks and "
             "capability questions => chat. For chat, reply as warm, calm, lightly playful "
             "Remi in at most 3 short sentences, focused on reminders. unknown asks exactly "
@@ -278,7 +298,7 @@ class OpenAIIntentInterpreter:
 
     @staticmethod
     def _select_history(
-        message: str, history: list[dict[str, str]], limit: int = 4
+        message: str, history: list[dict[str, str]], limit: int = 8
     ) -> list[dict[str, str]]:
         """Only pay for history when the latest message appears context-dependent."""
         normalized = message.lower().strip()

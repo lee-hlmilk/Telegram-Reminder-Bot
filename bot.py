@@ -74,9 +74,12 @@ def format_reminder_list(
     user_id: int,
     title: str,
     timezone: ZoneInfo | None = None,
+    reminders: list[Any] | None = None,
 ) -> str:
-    reminders = service.store.list_for_user(user_id)
+    reminders = reminders if reminders is not None else service.store.list_for_user(user_id)
     if not reminders:
+        if title != "📋 Your reminders":
+            return "_No active reminders matched that topic\\._"
         return "_You have no active reminders\\._"
 
     display_timezone = timezone or service.timezone
@@ -329,9 +332,18 @@ def build_application(
             return
 
         if intent.action == "list":
+            matching = None
+            heading = "📋 Your reminders"
+            if intent.title:
+                matching = find_matching_reminders(service, user_id, intent.title)
+                heading = f"📋 Reminders matching “{intent.title}”"
             await respond(
                 format_reminder_list(
-                    service, user_id, "📋 Your reminders", user_timezone
+                    service,
+                    user_id,
+                    heading,
+                    user_timezone,
+                    reminders=matching,
                 ),
                 parse_mode="MarkdownV2",
             )

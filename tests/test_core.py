@@ -216,14 +216,14 @@ class ReminderCoreTests(unittest.TestCase):
             [],
         )
 
-    def test_contextual_follow_up_uses_only_four_recent_turns(self) -> None:
+    def test_contextual_follow_up_uses_up_to_eight_recent_turns(self) -> None:
         history = [
-            {"role": "user", "content": f"message {index}"} for index in range(7)
+            {"role": "user", "content": f"message {index}"} for index in range(10)
         ]
         selected = OpenAIIntentInterpreter._select_history(
             "Actually make that tomorrow at 5pm", history
         )
-        self.assertEqual(selected, history[-4:])
+        self.assertEqual(selected, history[-8:])
 
     def test_fast_path_handles_common_read_only_requests(self) -> None:
         interpreter = OpenAIIntentInterpreter(
@@ -253,9 +253,18 @@ class ReminderCoreTests(unittest.TestCase):
         self.assertIsNone(
             interpreter._fast_intent("Remind me tomorrow at 5pm to call Mum")
         )
-        self.assertIsNone(
-            interpreter._fast_intent("Delete my science homework reminder")
+        named_delete = interpreter._fast_intent("Delete my science homework reminder")
+        self.assertEqual(named_delete.action, "delete")
+        self.assertEqual(named_delete.title, "science homework")
+
+    def test_fast_path_understands_topic_filtered_reminder_lists(self) -> None:
+        interpreter = OpenAIIntentInterpreter(
+            api_key="test-key", model="test", timezone=SGT
         )
+        question = interpreter._fast_intent("What Kahoot reminders are there?")
+        request = interpreter._fast_intent("Show me all my Kahoot reminders")
+        self.assertEqual((question.action, question.title), ("list", "kahoot"))
+        self.assertEqual((request.action, request.title), ("list", "kahoot"))
 
     def test_chat_intent_has_a_personality_reply(self) -> None:
         interpreter = OpenAIIntentInterpreter(
