@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from datetime import datetime
 from typing import Any
 
@@ -40,33 +39,46 @@ async def process_cloud_work(
     application: Application,
     service: ReminderService,
     settings_store: Any,
+    conversation_store: Any,
 ) -> dict[str, int]:
     """Deliver due work once; Firestore claims protect overlapping invocations."""
     now = datetime.now(service.timezone)
     reminder_store = service.store
-    warning_minutes = int(os.getenv("REMINDER_WARNING_MINUTES", "60"))
-    if warning_minutes < 1 or warning_minutes > 10080:
-        raise RuntimeError("REMINDER_WARNING_MINUTES must be between 1 and 10080")
-
-    upcoming = reminder_store.claim_upcoming(now, lead_minutes=warning_minutes)
     upcoming_sent = 0
     failed = 0
-    for reminder in upcoming:
-        due = reminder.due_datetime.astimezone(service.timezone)
-        try:
-            await application.bot.send_message(
-                chat_id=reminder.chat_id,
-                text=(
-                    "⏳ Upcoming reminder\n\n"
-                    f"📌 {reminder.text}\n"
-                    f"⏰ Due at {due:%H:%M}"
-                ),
-            )
-            upcoming_sent += 1
-        except Exception:
-            failed += 1
-            LOGGER.exception("Could not deliver advance warning %s", reminder.id)
-            reminder_store.release_upcoming_claim(reminder)
+    for warning_minutes in (60, 10):
+        upcoming = reminder_store.claim_upcoming(
+            now, lead_minutes=warning_minutes
+        )
+        for reminder in upcoming:
+            due = reminder.due_datetime.astimezone(service.timezone)
+            if warning_minutes == 60:
+                heading = "⏳ Reminder in 1 hour"
+                urgency = "You have one hour left to get ready."
+            else:
+                heading = "🚨 Reminder due very soon"
+                urgency = "Less than 10 minutes left — time to act!"
+            try:
+                await application.bot.send_message(
+                    chat_id=reminder.chat_id,
+                    text=(
+                        f"{heading}\n\n"
+                        f"📌 {reminder.text}\n"
+                        f"⏰ Due at {due:%H:%M}\n"
+                        f"{urgency}"
+                    ),
+                )
+                upcoming_sent += 1
+            except Exception:
+                failed += 1
+                LOGGER.exception(
+                    "Could not deliver %s-minute warning %s",
+                    warning_minutes,
+                    reminder.id,
+                )
+                reminder_store.release_upcoming_claim(
+                    reminder, warning_minutes
+                )
 
     claimed = reminder_store.claim_due(now)
     sent = 0
@@ -116,10 +128,12 @@ async def process_cloud_work(
             settings_store.release_daily_summary(setting.user_id, date_key)
 
     purged = reminder_store.purge_old(now)
+    sessions_purged = conversation_store.purge_expired(now)
     return {
         "advance_warnings_sent": upcoming_sent,
         "reminders_sent": sent,
         "summaries_sent": summaries,
         "purged": purged,
+        "conversation_sessions_purged": sessions_purged,
         "failed": failed,
     }

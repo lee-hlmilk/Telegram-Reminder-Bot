@@ -59,7 +59,8 @@ def _reminder_data(reminder: Reminder) -> dict[str, Any]:
         "recurrence_end_at": reminder.recurrence_end_datetime,
         "purge_at": _purge_at(reminder),
         "lease_until": None,
-        "advance_notice_for": None,
+        "advance_notice_60_for": None,
+        "advance_notice_10_for": None,
     }
 
 
@@ -201,7 +202,8 @@ class FirestoreReminderStore:
                     "status": "active",
                     "purge_at": _purge_at(updated),
                     "lease_until": None,
-                    "advance_notice_for": None,
+                    "advance_notice_60_for": None,
+                    "advance_notice_10_for": None,
                 },
             )
             return updated
@@ -274,14 +276,20 @@ class FirestoreReminderStore:
         self,
         now: datetime,
         *,
-        lead_minutes: int = 60,
+        lead_minutes: int,
         limit: int = 100,
     ) -> list[Reminder]:
-        """Claim reminders entering their advance-warning window exactly once."""
+        """Claim one warning stage for each reminder occurrence exactly once."""
+        if lead_minutes not in {10, 60}:
+            raise ValueError("Supported warning stages are 60 and 10 minutes")
+        notice_field = f"advance_notice_{lead_minutes}_for"
         warning_cutoff = now + timedelta(minutes=lead_minutes)
+        lower_cutoff = now + (
+            timedelta(minutes=10) if lead_minutes == 60 else timedelta(0)
+        )
         candidates = list(
             self.collection.where(filter=FieldFilter("status", "==", "active"))
-            .where(filter=FieldFilter("due_at", ">", now))
+            .where(filter=FieldFilter("due_at", ">", lower_cutoff))
             .where(filter=FieldFilter("due_at", "<=", warning_cutoff))
             .limit(limit)
             .stream()
@@ -299,16 +307,22 @@ class FirestoreReminderStore:
                     return None
                 value = current.to_dict() or {}
                 due_at = _as_datetime(value.get("due_at"))
-                already_sent_for = _as_datetime(value.get("advance_notice_for"))
+                created_at = _as_datetime(value.get("created_at"))
+                already_sent_for = _as_datetime(value.get(notice_field))
                 if (
                     value.get("status") != "active"
                     or due_at is None
-                    or due_at <= now
+                    or due_at <= lower_cutoff
                     or due_at > warning_cutoff
+                    or (
+                        lead_minutes == 60
+                        and created_at is not None
+                        and due_at - created_at < timedelta(minutes=60)
+                    )
                     or already_sent_for == due_at
                 ):
                     return None
-                transaction.update(reference, {"advance_notice_for": due_at})
+                transaction.update(reference, {notice_field: due_at})
                 return _reminder_from_document(current)
 
             reminder = claim(transaction)
@@ -316,8 +330,13 @@ class FirestoreReminderStore:
                 claimed.append(reminder)
         return claimed
 
-    def release_upcoming_claim(self, reminder: Reminder) -> None:
+    def release_upcoming_claim(
+        self, reminder: Reminder, lead_minutes: int
+    ) -> None:
         """Allow a failed advance warning to be retried on the next worker run."""
+        if lead_minutes not in {10, 60}:
+            raise ValueError("Supported warning stages are 60 and 10 minutes")
+        notice_field = f"advance_notice_{lead_minutes}_for"
         reference = self.collection.document(reminder.id)
         transaction = self.client.transaction()
 
@@ -326,9 +345,9 @@ class FirestoreReminderStore:
             current = reference.get(transaction=transaction)
             if not current.exists:
                 return
-            sent_for = _as_datetime(current.get("advance_notice_for"))
+            sent_for = _as_datetime(current.get(notice_field))
             if sent_for == reminder.due_datetime:
-                transaction.update(reference, {"advance_notice_for": None})
+                transaction.update(reference, {notice_field: None})
 
         release(transaction)
 
@@ -357,7 +376,8 @@ class FirestoreReminderStore:
                 "status": "active",
                 "lease_until": None,
                 "purge_at": _purge_at(updated),
-                "advance_notice_for": None,
+                "advance_notice_60_for": None,
+                "advance_notice_10_for": None,
             }
         )
 

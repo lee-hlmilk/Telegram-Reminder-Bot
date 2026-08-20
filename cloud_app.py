@@ -13,6 +13,7 @@ from telegram import Update
 
 from bot import BOT_COMMANDS, build_application
 from reminder_bot.cloud_worker import process_cloud_work
+from reminder_bot.conversation_memory import FirestoreConversationStore
 from reminder_bot.firestore_storage import (
     FirestoreReminderStore,
     FirestoreUserSettingsStore,
@@ -49,6 +50,7 @@ if os.getenv("FIRESTORE_DATABASE"):
 firestore_client = firestore.Client(**firestore_options)
 reminder_store = FirestoreReminderStore(firestore_client)
 settings_store = FirestoreUserSettingsStore(firestore_client)
+conversation_store = FirestoreConversationStore(firestore_client)
 service = ReminderService(reminder_store, BOT_TIMEZONE)
 interpreter = OpenAIIntentInterpreter(
     api_key=OPENAI_API_KEY,
@@ -60,6 +62,7 @@ telegram_application = build_application(
     TELEGRAM_BOT_TOKEN,
     service,
     settings_store,
+    conversation_store,
     DEFAULT_DAILY_TIME,
     interpreter,
 )
@@ -117,4 +120,6 @@ def _verify_scheduler(authorization: str | None) -> None:
 @app.post("/jobs/process")
 async def scheduled_work(authorization: str | None = Header(default=None)) -> dict[str, int]:
     _verify_scheduler(authorization)
-    return await process_cloud_work(telegram_application, service, settings_store)
+    return await process_cloud_work(
+        telegram_application, service, settings_store, conversation_store
+    )

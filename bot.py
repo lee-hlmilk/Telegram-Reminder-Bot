@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime
 from typing import Any
 
@@ -44,6 +45,18 @@ You could say:
 • “Turn off my daily reminder.”
 
 Your daily summary starts enabled at 08:00. Tell me anytime if you’d prefer another time."""
+
+
+def confirmation_decision(message: str) -> bool | None:
+    normalized = re.sub(r"[^a-z ]", "", message.lower()).strip()
+    if re.match(r"^(no|n|cancel|stop|never ?mind|dont|do not)\b", normalized):
+        return False
+    if re.match(
+        r"^(yes|y|yeah|yep|confirm|sure|ok|okay|do it|go ahead|proceed)\b",
+        normalized,
+    ):
+        return True
+    return None
 
 
 def format_reminder_list(service: ReminderService, user_id: int, title: str) -> str:
@@ -113,6 +126,7 @@ def build_application(
     token: str,
     service: ReminderService,
     settings_store: Any,
+    conversation_store: Any,
     default_daily_time: str = "08:00",
     llm_interpreter: OpenAIIntentInterpreter | None = None,
 ) -> Application:
@@ -156,20 +170,58 @@ def build_application(
             or not update.effective_message.text
         ):
             return
-        ensure_daily_default(update.effective_user.id, update.effective_chat.id)
+        user_id = update.effective_user.id
+        message = update.effective_message.text
+        ensure_daily_default(user_id, update.effective_chat.id)
+        history = conversation_store.history(user_id)
+        pending = conversation_store.confirmation(user_id)
+        conversation_store.append(user_id, "user", message)
+
+        async def respond(text: str, **kwargs: Any) -> None:
+            await update.effective_message.reply_text(text, **kwargs)
+            conversation_store.append(user_id, "assistant", text)
+
+        if pending is not None:
+            decision = confirmation_decision(message)
+            if decision is False:
+                conversation_store.clear_confirmation(user_id)
+                await respond("Okay, cancelled — I didn’t delete anything.")
+                return
+            if decision is True:
+                conversation_store.clear_confirmation(user_id)
+                if pending.get("action") == "delete_all":
+                    removed = service.store.delete_active_for_user(
+                        user_id, datetime.now(service.timezone)
+                    )
+                    noun = "reminder" if len(removed) == 1 else "reminders"
+                    await respond(f"🗑 Done — I cleared {len(removed)} active {noun}.")
+                    return
+                if pending.get("action") == "delete":
+                    reminder_id = str(pending.get("reminder_id", ""))
+                    deleted = service.store.delete_for_user(reminder_id, user_id)
+                    if deleted:
+                        await respond(f"🗑 Removed “{pending.get('title', 'reminder')}”.")
+                    else:
+                        await respond("That reminder is no longer active, so there was nothing to delete.")
+                    return
+            # A new request implicitly abandons the old confirmation.
+            conversation_store.clear_confirmation(user_id)
         try:
-            intent = await llm_interpreter.interpret(update.effective_message.text)
+            intent = await llm_interpreter.interpret(message, history=history)
         except LLMUnavailableError:
             LOGGER.exception("OpenAI intent interpretation failed")
-            await update.effective_message.reply_text(
+            await respond(
                 "I can’t reach the language service right now. Please try again shortly."
             )
             return
-        except IntentInterpretationError:
-            await update.effective_message.reply_text(
-                "I’m not confident I understood that. Please rephrase it with the "
-                "reminder, date, and time you want."
-            )
+        except IntentInterpretationError as exc:
+            try:
+                question = await llm_interpreter.clarification(
+                    message, history, str(exc)
+                )
+            except (IntentInterpretationError, LLMUnavailableError):
+                question = "What reminder, date, or time would you like me to clarify?"
+            await respond(question)
             return
 
         if intent.action == "create" and intent.due_at:
@@ -184,10 +236,10 @@ def build_application(
                     recurrence_end_at=intent.recurrence_end_at,
                 )
             except ReminderInputError as exc:
-                await update.effective_message.reply_text(f"⚠️ {exc}")
+                await respond(f"⚠️ {exc}")
                 return
             due = reminder.due_datetime.astimezone(service.timezone)
-            await update.effective_message.reply_text(
+            await respond(
                 "✅ Reminder created!\n\n"
                 f"📌 {reminder.text}\n"
                 f"📅 {due:%d %b %Y}\n"
@@ -207,7 +259,7 @@ def build_application(
             return
 
         if intent.action == "list":
-            await update.effective_message.reply_text(
+            await respond(
                 format_reminder_list(
                     service, update.effective_user.id, "📋 Your reminders"
                 ),
@@ -216,7 +268,7 @@ def build_application(
             return
 
         if intent.action == "old":
-            await update.effective_message.reply_text(
+            await respond(
                 format_old_reminder_list(service, update.effective_user.id),
                 parse_mode="MarkdownV2",
             )
@@ -233,22 +285,22 @@ def build_application(
                 )
             else:
                 reply = "Your daily reminder is currently turned off."
-            await update.effective_message.reply_text(reply)
+            await respond(reply)
             return
 
         if intent.action == "delete_all":
-            removed = service.store.delete_active_for_user(
-                update.effective_user.id, datetime.now(service.timezone)
+            active = service.store.list_for_user(user_id)
+            if not active:
+                await respond("Your active reminder list is already empty.")
+                return
+            conversation_store.set_confirmation(
+                user_id, action="delete_all", count=len(active)
             )
-            if removed:
-                noun = "reminder" if len(removed) == 1 else "reminders"
-                await update.effective_message.reply_text(
-                    f"🗑 Done — I cleared {len(removed)} active {noun}."
-                )
-            else:
-                await update.effective_message.reply_text(
-                    "Your active reminder list is already empty."
-                )
+            noun = "reminder" if len(active) == 1 else "reminders"
+            await respond(
+                f"This will permanently delete {len(active)} active {noun}. "
+                "Reply yes to confirm or no to cancel."
+            )
             return
 
         if intent.action == "set_daily":
@@ -262,12 +314,12 @@ def build_application(
                     last_daily_sent_on=(current.last_daily_sent_on if current else None),
                 )
                 settings_store.save(setting)
-                await update.effective_message.reply_text("Daily reminders are disabled.")
+                await respond("Daily reminders are disabled.")
                 return
             try:
                 parsed_time = parse_daily_time(intent.daily_time or "")
             except ReminderInputError:
-                await update.effective_message.reply_text(
+                await respond(
                     "I understood the daily setting, but not its time. Try “Send my "
                     "daily reminders at 8:30am.”"
                 )
@@ -281,14 +333,14 @@ def build_application(
                 last_daily_sent_on=(current.last_daily_sent_on if current else None),
             )
             settings_store.save(setting)
-            await update.effective_message.reply_text(
+            await respond(
                 f"✅ Daily reminders will be sent at {setting.daily_time} "
                 f"({service.timezone.key})."
             )
             return
 
         if intent.action == "chat":
-            await update.effective_message.reply_text(intent.reply)
+            await respond(intent.reply)
             return
 
         if intent.action in {"delete", "complete", "update"}:
@@ -296,8 +348,9 @@ def build_application(
                 service, update.effective_user.id, intent.title
             )
             if not matches:
-                await update.effective_message.reply_text(
-                    f'I could not find an active reminder matching “{intent.title}”.'
+                await respond(
+                    f'I couldn’t find an active reminder matching “{intent.title}”. '
+                    "Which reminder did you mean?"
                 )
                 return
             if len(matches) > 1:
@@ -310,13 +363,22 @@ def build_application(
                     f"{item.due_datetime.astimezone(service.timezone):%d %b}"
                     for item in matches
                 )
-                await update.effective_message.reply_text("\n".join(choices))
+                await respond("\n".join(choices))
                 return
 
             reminder = matches[0]
             if intent.action == "delete":
-                service.store.delete_for_user(reminder.id, update.effective_user.id)
-                reply = f"🗑 Removed “{reminder.text}”."
+                conversation_store.set_confirmation(
+                    user_id,
+                    action="delete",
+                    reminder_id=reminder.id,
+                    title=reminder.text,
+                )
+                await respond(
+                    f"Permanently delete “{reminder.text}”? "
+                    "Reply yes to confirm or no to cancel."
+                )
+                return
             elif intent.action == "complete":
                 service.store.set_status_for_user(
                     reminder.id, update.effective_user.id, "completed"
@@ -330,18 +392,21 @@ def build_application(
                         due_at=intent.due_at,
                     )
                 except ReminderInputError as exc:
-                    await update.effective_message.reply_text(f"⚠️ {exc}")
+                    await respond(f"⚠️ {exc}")
                     return
                 reply = (
                     f"✅ I moved “{updated.text}” to "
                     f"{updated.due_datetime.astimezone(service.timezone):%d %b %Y at %H:%M}."
                 )
-            await update.effective_message.reply_text(reply)
+            await respond(reply)
             return
 
-        await update.effective_message.reply_text(
-            "I didn’t quite catch that. I’m best at reminders and schedules—try "
-            "telling me what to remember and when, or ask what you have coming up."
+        if intent.action == "unknown":
+            await respond(intent.reply)
+            return
+
+        await respond(
+            "What would you like me to clarify about the reminder or schedule?"
         )
 
     application.add_handler(CommandHandler("start", start_command))

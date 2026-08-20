@@ -41,6 +41,12 @@ class IntentOutput(BaseModel):
     confidence: float = Field(ge=0, le=1)
 
 
+class ClarificationOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    question: str
+
+
 class IntentInterpretationError(RuntimeError):
     """The message could not safely be converted into an action."""
 
@@ -71,21 +77,32 @@ class OpenAIIntentInterpreter:
         )
 
     async def interpret(
-        self, message: str, now: datetime | None = None
+        self,
+        message: str,
+        now: datetime | None = None,
+        history: list[dict[str, str]] | None = None,
     ) -> ConversationIntent:
         current = now or datetime.now(self.timezone)
         try:
-            output = await asyncio.to_thread(self._request, message, current)
+            output = await asyncio.to_thread(
+                self._request, message, current, history or []
+            )
         except OpenAIError as exc:
             raise LLMUnavailableError("OpenAI request failed") from exc
         return self._to_intent(output, current)
 
-    def _request(self, message: str, current: datetime) -> IntentOutput:
+    def _request(
+        self,
+        message: str,
+        current: datetime,
+        history: list[dict[str, str]],
+    ) -> IntentOutput:
         instructions = self._instructions(current)
         response = self.client.responses.parse(
             model=self.model,
             input=[
                 {"role": "system", "content": instructions},
+                *history,
                 {"role": "user", "content": message},
             ],
             text_format=IntentOutput,
@@ -94,11 +111,58 @@ class OpenAIIntentInterpreter:
             raise IntentInterpretationError("The model did not return a usable intent")
         return response.output_parsed
 
+    async def clarification(
+        self,
+        message: str,
+        history: list[dict[str, str]],
+        reason: str,
+    ) -> str:
+        try:
+            output = await asyncio.to_thread(
+                self._clarification_request, message, history, reason
+            )
+        except OpenAIError as exc:
+            raise LLMUnavailableError("OpenAI clarification request failed") from exc
+        question = output.question.strip()
+        if not question:
+            raise IntentInterpretationError("The clarification was empty")
+        return question
+
+    def _clarification_request(
+        self,
+        message: str,
+        history: list[dict[str, str]],
+        reason: str,
+    ) -> ClarificationOutput:
+        response = self.client.responses.parse(
+            model=self.model,
+            input=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are Remi, a reminder assistant. The latest request could "
+                        "not be executed safely. Ask exactly one short, specific question "
+                        "that obtains only the missing or ambiguous reminder detail. "
+                        "Use recent conversation context. Do not claim an action occurred. "
+                        f"Validation reason: {reason}"
+                    ),
+                },
+                *history,
+                {"role": "user", "content": message},
+            ],
+            text_format=ClarificationOutput,
+        )
+        if response.output_parsed is None:
+            raise IntentInterpretationError("The model did not return a clarification")
+        return response.output_parsed
+
     def _instructions(self, current: datetime) -> str:
         return (
             "Classify the user's message for a reminder bot. Do not execute actions. "
             "Interpret natural, casual English by meaning rather than requiring command "
-            "words. Use create to add a reminder; delete to permanently remove one named "
+            "words. Use recent conversation turns to resolve follow-ups such as 'make "
+            "that 5pm', 'move it to tomorrow', or 'delete that one', but never invent "
+            "context that is absent. Use create to add a reminder; delete to permanently remove one named "
             "reminder; delete_all to remove every active reminder belonging to the user; "
             "complete to mark one named reminder completed; update to change the date or "
             "time of one named reminder; list to show upcoming active "
@@ -129,13 +193,14 @@ class OpenAIIntentInterpreter:
             "natural reply of at most three short sentences in reply. Stay focused on "
             "reminders and scheduling; if asked for unrelated knowledge or unsupported "
             "actions, respond briefly and steer back to what you can do. Never claim an "
-            "action happened when action is chat. For every non-chat action, reply must "
+            "action happened when action is chat. For every non-chat action except unknown, reply must "
             "be an empty string because the application will acknowledge it after it is "
             "safely completed. Examples: 'hi', 'hello', 'hey there', 'good morning', 'thanks', "
             "'how are you?', and 'what can you do?' mean chat. "
             "Questions such as 'when is my daily reminder?', 'what time is my daily "
-            "summary?', and 'are daily reminders on?' mean settings. Use unknown only "
-            "when none of the supported meanings fit. "
+            "summary?', and 'are daily reminders on?' mean settings. Use unknown when a "
+            "supported request is missing or has conflicting details. For unknown, put "
+            "one short and focused clarification question in reply. "
             "A request to tell, show, read, list, or describe the user's reminders means "
             "list even when it is phrased as a short question or does not contain the word "
             "list. Exact examples 'tell me my reminders', 'show me my reminders', 'what "
@@ -187,7 +252,7 @@ class OpenAIIntentInterpreter:
         # Read-only requests are safe to honor at a lower confidence than mutations.
         minimum_confidence = (
             0.4
-            if value.action in {"chat", "list", "old", "settings"}
+            if value.action in {"chat", "list", "old", "settings", "unknown"}
             else self.minimum_confidence
         )
         if not math.isfinite(value.confidence) or value.confidence < minimum_confidence:
@@ -254,6 +319,8 @@ class OpenAIIntentInterpreter:
         reply = value.reply.strip()
         if value.action == "chat" and not reply:
             raise IntentInterpretationError("The conversational reply is missing")
+        if value.action == "unknown" and not reply:
+            raise IntentInterpretationError("The clarification question is missing")
 
         return ConversationIntent(
             action=value.action,

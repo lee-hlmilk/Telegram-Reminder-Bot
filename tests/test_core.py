@@ -2,6 +2,7 @@ import unittest
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+from bot import confirmation_decision
 from reminder_bot.models import UserSettings
 from reminder_bot.models import Reminder
 from reminder_bot.llm import IntentInterpretationError, IntentOutput, OpenAIIntentInterpreter
@@ -20,6 +21,12 @@ SGT = ZoneInfo("Asia/Singapore")
 
 
 class ReminderCoreTests(unittest.TestCase):
+    def test_confirmation_language_is_understood(self) -> None:
+        self.assertIs(confirmation_decision("yes please"), True)
+        self.assertIs(confirmation_decision("go ahead!"), True)
+        self.assertIs(confirmation_decision("never mind"), False)
+        self.assertIsNone(confirmation_decision("remind me tomorrow"))
+
     def test_firestore_utc_timestamp_converts_back_to_singapore_time(self) -> None:
         reminder = Reminder(
             id="abc123",
@@ -97,6 +104,28 @@ class ReminderCoreTests(unittest.TestCase):
         self.assertIn("clear my reminders", prompt)
         self.assertIn("delete_all", prompt)
         self.assertIn("when is my daily reminder?", prompt)
+        self.assertIn("make that 5pm", prompt)
+
+    def test_unknown_intent_returns_a_clarification_question(self) -> None:
+        interpreter = OpenAIIntentInterpreter(
+            api_key="test-key", model="test", timezone=SGT
+        )
+        intent = interpreter._to_intent(
+            IntentOutput(
+                action="unknown",
+                title="",
+                due_at=None,
+                trigger_phrase=None,
+                daily_time=None,
+                daily_enabled=None,
+                reply="What time should I remind you?",
+                recurrence_frequency="none",
+                recurrence_interval=1,
+                recurrence_end_at=None,
+                confidence=0.2,
+            )
+        )
+        self.assertEqual(intent.reply, "What time should I remind you?")
 
     def test_read_only_list_intent_accepts_moderate_confidence(self) -> None:
         interpreter = OpenAIIntentInterpreter(
